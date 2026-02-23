@@ -26,21 +26,40 @@ def _ocr_winocr(image: Image.Image) -> tuple[str, list[dict[str, Any]]]:
     import winocr
     import asyncio
 
-    # winocr.recognize_pil is async; run it in an event loop
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
+    # Try OCR languages in preference order; the first that succeeds wins.
+    # Windows ships with locale-specific OCR packs (e.g. es-MX, pt-BR) and may
+    # not have en-US installed.  We try common languages until one works.
+    _LANGS = ["en", "es", "es-MX", "pt", "fr", "de", "it", "ja", "zh-Hans", "ko"]
 
-    if loop and loop.is_running():
-        # Already in an async context — create a new thread to run it
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor() as pool:
-            result = pool.submit(
-                asyncio.run, winocr.recognize_pil(image, lang="en")
-            ).result()
-    else:
-        result = asyncio.run(winocr.recognize_pil(image, lang="en"))
+    async def _run(img, lang):
+        return await winocr.recognize_pil(img, lang=lang)
+
+    def _sync_run(img, lang):
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop and loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                return pool.submit(asyncio.run, _run(img, lang)).result()
+        else:
+            return asyncio.run(_run(img, lang))
+
+    result = None
+    for lang in _LANGS:
+        try:
+            result = _sync_run(image, lang)
+            logger.info("OCR succeeded with language: %s", lang)
+            break
+        except Exception:
+            continue
+
+    if result is None:
+        raise RuntimeError(
+            "No working OCR language found. Install a language pack: "
+            "Add-WindowsCapability -Online -Name 'Language.OCR~~~en-US~0.0.1.0'"
+        )
 
     lines = result.lines if hasattr(result, "lines") else []
     full_text_parts: list[str] = []

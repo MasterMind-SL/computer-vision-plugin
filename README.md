@@ -40,6 +40,7 @@ claude --plugin-dir .
 - Windows 10 21H2+ or Windows 11
 - Python 3.11+
 - `uv` package manager
+- At least one Windows OCR language pack (see [OCR Language Support](#ocr-language-support))
 
 ## Tools Reference
 
@@ -80,6 +81,31 @@ claude --plugin-dir .
 2. `cv_focus_window` — bring it to front
 3. `cv_type_text` / `cv_send_keys` — interact
 4. `cv_screenshot_window` — verify result
+
+## OCR Language Support
+
+The `cv_ocr` tool uses Windows' built-in OCR engine via `winocr`. It auto-detects installed language packs — English is **not** required.
+
+**Check installed languages:**
+
+```powershell
+# PowerShell (no elevation needed)
+[Windows.Media.Ocr.OcrEngine,Windows.Foundation,ContentType=WindowsRuntime] | Out-Null
+[Windows.Media.Ocr.OcrEngine]::AvailableRecognizerLanguages | Select-Object LanguageTag
+```
+
+Most Windows installations include the OCR pack for the system locale (e.g. `es-MX`, `pt-BR`, `fr-FR`). The plugin tries languages in this order: `en`, `es`, `es-MX`, `pt`, `fr`, `de`, `it`, `ja`, `zh-Hans`, `ko` — using the first one that works.
+
+**To install additional languages** (elevated PowerShell):
+
+```powershell
+# English
+Add-WindowsCapability -Online -Name "Language.OCR~~~en-US~0.0.1.0"
+# Spanish
+Add-WindowsCapability -Online -Name "Language.OCR~~~es-ES~0.0.1.0"
+```
+
+After installing a new language pack, restart Claude Code for the MCP server to pick it up.
 
 ## Configuration
 

@@ -27,6 +27,11 @@ This is an MCP plugin that gives Claude Code full computer vision and input cont
 - Integration tests in `tests/integration/` require real Windows desktop
 - Run: `uv run pytest tests/unit/ -v`
 
+## OCR
+- `cv_ocr` auto-detects installed Windows OCR languages — does NOT require `en-US`.
+- Language fallback order: `en`, `es`, `es-MX`, `pt`, `fr`, `de`, `it`, `ja`, `zh-Hans`, `ko`.
+- Pytesseract is a secondary fallback if `winocr` is unavailable.
+
 ## Dependencies
 mcp, mss, pywin32, Pillow, winocr, comtypes, pydantic — all installed via `uv sync`.
 
