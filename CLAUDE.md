@@ -29,3 +29,16 @@ This is an MCP plugin that gives Claude Code full computer vision and input cont
 
 ## Dependencies
 mcp, mss, pywin32, Pillow, winocr, comtypes, pydantic — all installed via `uv sync`.
+
+## Distribution
+
+The plugin marketplace repo is `MasterMind-SL/Marketplace`. Install command:
+```
+/plugin marketplace add MasterMind-SL/Marketplace
+/plugin install computer-vision@mastermind-marketplace
+```
+
+For development:
+```bash
+claude --plugin-dir /path/to/computer-vision-plugin
+```

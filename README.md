@@ -17,13 +17,22 @@ This MCP plugin gives Claude Code the ability to see and interact with any windo
 
 ## Installation
 
-```bash
-# Via marketplace
-claude plugin install computer-vision-plugin
+Inside Claude Code:
 
-# Or manually
-cd <plugin-directory>
+```
+/plugin marketplace add MasterMind-SL/Marketplace
+/plugin install computer-vision@mastermind-marketplace
+```
+
+Then restart Claude Code and run `/cv-setup` to verify dependencies.
+
+### Manual (development)
+
+```bash
+git clone https://github.com/MasterMind-SL/computer-vision-plugin
+cd computer-vision-plugin
 uv sync
+claude --plugin-dir .
 ```
 
 ## Requirements
