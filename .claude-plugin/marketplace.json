@@ -1,0 +1,34 @@
+{
+  "name": "computer-vision-plugin",
+  "owner": {
+    "name": "MasterMind-SL"
+  },
+  "metadata": {
+    "description": "Desktop computer vision and input control for Claude Code on Windows",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "computer-vision",
+      "source": "./",
+      "description": "Desktop computer vision and input control for Claude Code on Windows. Capture screenshots, enumerate windows, click, type, OCR, and read UI accessibility trees across any Windows application.",
+      "version": "1.0.0",
+      "author": {
+        "name": "MasterMind-SL"
+      },
+      "repository": "https://github.com/MasterMind-SL/computer-vision-plugin",
+      "license": "MIT",
+      "keywords": [
+        "computer-vision",
+        "windows",
+        "desktop",
+        "automation",
+        "mcp",
+        "screenshot",
+        "ocr",
+        "accessibility"
+      ],
+      "category": "utilities"
+    }
+  ]
+}
