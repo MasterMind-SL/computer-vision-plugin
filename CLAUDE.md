@@ -11,7 +11,7 @@ This is an MCP plugin that gives Claude Code full computer vision and input cont
 
 ## Coding Conventions
 - **Models**: Use Pydantic `BaseModel` for all data models (not dataclasses)
-- **Errors**: Use `make_error(code, message)` and `make_success(**payload)` from `src/errors.py`
+- **Errors**: Use `make_error(code, message)` and `make_success(**payload)` from `src/errors.py` for non-image tools
 - **Security**: All mutating tools (F5-F9) must call security gate before execution:
   1. `validate_hwnd_fresh(hwnd)` — check window still exists
   2. `check_restricted(process_name)` — block restricted processes
@@ -19,7 +19,7 @@ This is an MCP plugin that gives Claude Code full computer vision and input cont
   4. `guard_dry_run(tool, params)` — return early if dry-run
   5. `log_action(tool, params, status)` — audit log
 - **Coordinates**: Screen-absolute physical pixels by default. DPI awareness set at startup.
-- **Screenshots**: Return base64 PNG via `encode_image()`. Use `capture_window_raw()` internally for OCR.
+- **Screenshots**: Return native MCP `[ImageContent, TextContent]` content blocks via `_make_image_response()` in `capture.py`. Use `ImageContent` from `mcp.types` directly — do NOT use FastMCP's `Image` wrapper (double-encoding risk). Use `capture_window_raw()` / `capture_region_raw()` internally for OCR to avoid encode-decode round-trips.
 - **Imports**: Tool files import `mcp` from `src.server`, NOT create their own FastMCP instance.
 
 ## Testing

@@ -174,6 +174,23 @@ def capture_window_raw(hwnd: int) -> Image.Image | None:
         return None
 
 
+def capture_region_raw(x0: int, y0: int, x1: int, y1: int) -> Image.Image | None:
+    """Capture a screen region and return as PIL Image (no encoding).
+
+    Used internally by OCR to avoid encode-decode round-trips.
+    Returns None on failure.
+    """
+    width = x1 - x0
+    height = y1 - y0
+    if width <= 0 or height <= 0:
+        return None
+    try:
+        return _capture_region_mss(x0, y0, width, height)
+    except Exception as exc:
+        logger.debug("capture_region_raw failed for (%s,%s)-(%s,%s): %s", x0, y0, x1, y1, exc)
+        return None
+
+
 def _capture_region_mss(left: int, top: int, width: int, height: int) -> Image.Image | None:
     """Capture a screen region using mss. Returns PIL Image or None on failure."""
     try:

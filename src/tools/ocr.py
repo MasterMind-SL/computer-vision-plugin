@@ -12,7 +12,7 @@ from PIL import Image
 from src.server import mcp
 from src.errors import make_error, make_success, OCR_UNAVAILABLE, INVALID_INPUT, CAPTURE_FAILED
 from src.utils.security import redact_ocr_output
-from src.utils.screenshot import capture_window_raw, capture_region
+from src.utils.screenshot import capture_window_raw, capture_region_raw
 
 logger = logging.getLogger(__name__)
 
@@ -159,12 +159,9 @@ def cv_ocr(
                 return make_error(CAPTURE_FAILED, f"Failed to capture window HWND={hwnd}")
 
         elif all(v is not None for v in (x0, y0, x1, y1)):
-            try:
-                result = capture_region(x0, y0, x1, y1)
-                raw = base64.b64decode(result.image_base64)
-                image = Image.open(io.BytesIO(raw))
-            except Exception as e:
-                return make_error(CAPTURE_FAILED, f"Failed to capture region: {e}")
+            image = capture_region_raw(x0, y0, x1, y1)
+            if image is None:
+                return make_error(CAPTURE_FAILED, f"Failed to capture region ({x0},{y0})-({x1},{y1})")
         else:
             return make_error(
                 INVALID_INPUT,
