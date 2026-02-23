@@ -1,7 +1,7 @@
 {
   "name": "computer-vision",
-  "version": "1.1.0",
-  "description": "Desktop computer vision and input control for Claude Code on Windows. Capture screenshots, enumerate windows, click, type, OCR, and read UI accessibility trees across any Windows application.",
+  "version": "1.2.0",
+  "description": "Desktop computer vision and input control for Claude Code on Windows. Screenshots return native images Claude can see directly. Capture windows, enumerate windows, click, type, OCR, and read UI accessibility trees across any Windows application.",
   "author": {
     "name": "MasterMind-SL"
   },
