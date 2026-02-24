@@ -1,7 +1,7 @@
 # Computer Vision Plugin for Claude Code
 
 ## Overview
-This is an MCP plugin that gives Claude Code full computer vision and input control across any Windows application. It provides 14 tools for screenshots, window management, mouse/keyboard input, OCR, UI accessibility, and multi-monitor support.
+This is an MCP plugin that gives Claude Code full computer vision and input control across any Windows application. It provides 16 tools for screenshots, window management, mouse/keyboard input, OCR, natural language element finding, text extraction, UI accessibility, and multi-monitor support.
 
 ## Architecture
 - **MCP server**: FastMCP over stdio transport (never HTTP/SSE)
@@ -18,6 +18,7 @@ This is an MCP plugin that gives Claude Code full computer vision and input cont
   3. `check_rate_limit()` — enforce rate limit
   4. `guard_dry_run(tool, params)` — return early if dry-run
   5. `log_action(tool, params, status)` — audit log
+- **Security (read-only tools)**: `cv_ocr`, `cv_find`, `cv_get_text`, `cv_read_ui` use subset: `validate_hwnd_range` + `validate_hwnd_fresh` + `check_restricted` + `log_action` (no rate limit or dry-run).
 - **Coordinates**: Screen-absolute physical pixels by default. DPI awareness set at startup.
 - **Screenshots**: Save images to temp files (`%TEMP%/cv_plugin_screenshots/`) and return `image_path` in the JSON response. Claude uses the `Read` tool on `image_path` to view images natively as a multimodal LLM. Files auto-clean after 5 minutes. Use `capture_window_raw()` / `capture_region_raw()` internally for OCR to avoid file round-trips.
 - **Imports**: Tool files import `mcp` from `src.server`, NOT create their own FastMCP instance.
@@ -28,9 +29,12 @@ This is an MCP plugin that gives Claude Code full computer vision and input cont
 - Run: `uv run pytest tests/unit/ -v`
 
 ## OCR
-- `cv_ocr` auto-detects installed Windows OCR languages — does NOT require `en-US`.
-- Language fallback order: `en`, `es`, `es-MX`, `pt`, `fr`, `de`, `it`, `ja`, `zh-Hans`, `ko`.
+- `cv_ocr` auto-detects installed Windows OCR languages via `OcrEngine` singleton in `src/utils/ocr_engine.py`.
+- Language preference: `en-US` > `en-*` > other installed. Callers can force a language with `lang` parameter.
+- Image preprocessing (enabled by default): upscale small images, grayscale, sharpen, auto-contrast.
+- Bounding boxes extracted from `word.bounding_rect` on winocr word objects. Origin offset translates to screen-absolute.
 - Pytesseract is a secondary fallback if `winocr` is unavailable.
+- Default PII redaction patterns (SSN, credit card) applied to all OCR/text output.
 
 ## Dependencies
 mcp, mss, pywin32, Pillow, winocr, comtypes, pydantic — all installed via `uv sync`.

@@ -10,7 +10,9 @@ This MCP plugin gives Claude Code the ability to see and interact with any windo
 - **List windows** with title, process, position, and monitor info
 - **Click** anywhere on screen (left/right/double/middle/drag)
 - **Type text** and **send keyboard shortcuts** to any application
-- **OCR** — extract text from any window with bounding boxes
+- **OCR** — extract text from any window with bounding boxes and confidence scores
+- **Find elements** by natural language (like Chrome MCP's `find`, but for any app)
+- **Extract text** from any window — UIA for native apps, OCR fallback for Chrome/Electron
 - **Read UI trees** via Windows UI Automation (like `read_page` for desktop apps)
 - **Multi-monitor** support with DPI awareness
 - **Wait** for windows to appear before interacting
@@ -55,7 +57,9 @@ claude --plugin-dir .
 | `cv_type_text` | Type text into the foreground window (Unicode) |
 | `cv_send_keys` | Send key combinations (Ctrl+S, Alt+Tab, etc.) |
 | `cv_move_window` | Move/resize a window or maximize/minimize/restore |
-| `cv_ocr` | Extract text from a window or region with bounding boxes |
+| `cv_ocr` | Extract text from a window or region with bounding boxes and confidence |
+| `cv_find` | Find elements by natural language query (UIA + OCR fuzzy search) |
+| `cv_get_text` | Extract all visible text from a window (UIA primary, OCR fallback) |
 | `cv_list_monitors` | List all monitors with resolution, DPI, and position |
 | `cv_read_ui` | Read the UI accessibility tree of a window |
 | `cv_wait_for_window` | Wait for a window matching a title pattern to appear |
@@ -75,8 +79,13 @@ claude --plugin-dir .
 3. `cv_mouse_click(x=<X>, y=<Y>)` — click it
 4. `cv_screenshot_window` — verify the click worked
 
+**Find and click an element by description:**
+1. `cv_find(query="Submit button", hwnd=<HWND>)` — find element by natural language
+2. Click the returned bbox center coordinates with `cv_mouse_click`
+
 **Read text from any app:**
-1. `cv_ocr(hwnd=<HWND>)` — extract all visible text with positions
+1. `cv_get_text(hwnd=<HWND>)` — extract all text (UIA for native apps, OCR fallback)
+2. Or `cv_ocr(hwnd=<HWND>)` — extract text with bounding boxes and word positions
 
 **Automate a workflow:**
 1. `cv_list_windows` — find target app
@@ -86,7 +95,7 @@ claude --plugin-dir .
 
 ## OCR Language Support
 
-The `cv_ocr` tool uses Windows' built-in OCR engine via `winocr`. It auto-detects installed language packs — English is **not** required.
+The `cv_ocr` tool uses Windows' built-in OCR engine via `winocr`. It auto-detects installed language packs and prefers `en-US` when available. You can force a specific language with the `lang` parameter.
 
 **Check installed languages:**
 
@@ -96,7 +105,7 @@ The `cv_ocr` tool uses Windows' built-in OCR engine via `winocr`. It auto-detect
 [Windows.Media.Ocr.OcrEngine]::AvailableRecognizerLanguages | Select-Object LanguageTag
 ```
 
-Most Windows installations include the OCR pack for the system locale (e.g. `es-MX`, `pt-BR`, `fr-FR`). The plugin tries languages in this order: `en`, `es`, `es-MX`, `pt`, `fr`, `de`, `it`, `ja`, `zh-Hans`, `ko` — using the first one that works.
+The plugin caches available languages at first use and prefers English regardless of system locale. Image preprocessing (upscale, grayscale, sharpen, contrast) is enabled by default for better accuracy.
 
 **To install additional languages** (elevated PowerShell):
 
@@ -121,7 +130,7 @@ Environment variables (all optional):
 | `CV_MAX_TEXT_LENGTH` | `1000` | Max characters for `cv_type_text` |
 | `CV_RATE_LIMIT` | `20` | Max input actions per second |
 | `CV_AUDIT_LOG_PATH` | `%LOCALAPPDATA%/claude-cv-plugin/audit.jsonl` | Audit log location |
-| `CV_OCR_REDACTION_PATTERNS` | (empty) | Regex patterns to redact from OCR output |
+| `CV_OCR_REDACTION_PATTERNS` | SSN + credit card patterns | Regex patterns to redact from OCR/text output |
 
 ## Security
 
@@ -157,12 +166,14 @@ src/
 ├── models.py            # Pydantic models
 ├── dpi.py               # DPI awareness helpers
 ├── coordinates.py       # Coordinate transforms
-├── tools/               # MCP tool definitions (14 tools)
+├── tools/               # MCP tool definitions (16 tools)
 │   ├── windows.py       # F1, F5, F9
 │   ├── capture.py       # F2, F3, F4 (saves to temp file, returns path)
 │   ├── input_mouse.py   # F6
 │   ├── input_keyboard.py # F7, F8
-│   ├── ocr.py           # F10
+│   ├── ocr.py           # F10 (delegates to OcrEngine)
+│   ├── find.py          # cv_find — natural language element finder
+│   ├── text_extract.py  # cv_get_text — clean text extraction
 │   ├── monitors.py      # F11
 │   ├── accessibility.py # F12
 │   └── synchronization.py # F13
@@ -170,8 +181,9 @@ src/
     ├── screenshot.py     # mss + PrintWindow capture
     ├── win32_input.py    # ctypes SendInput wrappers
     ├── win32_window.py   # pywin32 window management
-    ├── security.py       # Security gate + audit log
-    └── uia.py            # UI Automation tree walker
+    ├── security.py       # Security gate + audit log + PII redaction
+    ├── uia.py            # UI Automation tree walker
+    └── ocr_engine.py     # OcrEngine (language cache, preprocessing, bbox extraction)
 ```
 
 ## Dependencies
