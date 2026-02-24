@@ -20,6 +20,15 @@ logger = logging.getLogger(__name__)
 _action_timestamps: list[float] = []
 
 
+def validate_hwnd_range(hwnd: int) -> None:
+    """Validate that an HWND is within the valid Win32 range.
+
+    Raises ValueError if hwnd is out of range.
+    """
+    if not (0 < hwnd <= 0xFFFFFFFF):
+        raise ValueError(f"Invalid HWND: {hwnd}. Must be in range (0, 0xFFFFFFFF].")
+
+
 def check_restricted(process_name: str) -> None:
     """Check if a process is in the restricted list. Raises AccessDeniedError if restricted."""
     if process_name.lower() in config.RESTRICTED_PROCESSES:
@@ -95,37 +104,48 @@ def log_action(tool_name: str, params: dict[str, Any], result_status: str) -> No
         logger.warning("Failed to write audit log: %s", e)
 
 
-def redact_ocr_output(text: str, regions: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
-    """Apply redaction patterns to OCR output.
-
-    Returns (redacted_text, redacted_regions).
-    """
-    patterns = config.OCR_REDACTION_PATTERNS
-    if not patterns:
-        return text, regions
-
-    redacted_text = text
-    redacted_regions = []
+def _apply_redaction_patterns(text: str, patterns: list[str]) -> str:
+    """Apply regex redaction patterns to a string."""
     for pattern in patterns:
         if not pattern:
             continue
         try:
             regex = re.compile(pattern, re.IGNORECASE)
-            redacted_text = regex.sub("[REDACTED]", redacted_text)
+            text = regex.sub("[REDACTED]", text)
         except re.error:
             continue
+    return text
 
+
+def redact_ocr_output(text: str, regions: list[Any]) -> tuple[str, list[Any]]:
+    """Apply redaction patterns to OCR output.
+
+    Accepts regions as list[dict] or list[OcrRegion] (Pydantic models).
+    Returns (redacted_text, redacted_regions) preserving the input type.
+    """
+    patterns = config.OCR_REDACTION_PATTERNS
+    if not patterns:
+        return text, regions
+
+    redacted_text = _apply_redaction_patterns(text, patterns)
+
+    redacted_regions = []
     for region in regions:
-        r = dict(region)
-        for pattern in patterns:
-            if not pattern:
-                continue
-            try:
-                regex = re.compile(pattern, re.IGNORECASE)
-                r["text"] = regex.sub("[REDACTED]", r.get("text", ""))
-            except re.error:
-                continue
-        redacted_regions.append(r)
+        # Support both dict and Pydantic BaseModel (OcrRegion)
+        if hasattr(region, "model_copy"):
+            # Pydantic v2 model
+            r = region.model_copy(deep=True)
+            r.text = _apply_redaction_patterns(r.text, patterns)
+            # Also redact word-level text if present
+            if hasattr(r, "words") and r.words:
+                for word in r.words:
+                    word.text = _apply_redaction_patterns(word.text, patterns)
+            redacted_regions.append(r)
+        else:
+            # Plain dict
+            r = dict(region)
+            r["text"] = _apply_redaction_patterns(r.get("text", ""), patterns)
+            redacted_regions.append(r)
 
     return redacted_text, redacted_regions
 

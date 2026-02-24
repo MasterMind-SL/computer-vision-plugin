@@ -58,7 +58,11 @@ AUDIT_LOG_PATH: Path = Path(
 )
 
 # OCR redaction patterns — regex patterns to redact from OCR output
-OCR_REDACTION_PATTERNS: list[str] = _get_env_list("CV_OCR_REDACTION_PATTERNS", "")
+# Default patterns: SSN and credit card numbers
+_DEFAULT_PII_PATTERNS = r"\b\d{3}-\d{2}-\d{4}\b,\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b"
+OCR_REDACTION_PATTERNS: list[str] = _get_env_list(
+    "CV_OCR_REDACTION_PATTERNS", _DEFAULT_PII_PATTERNS
+)
 
 # Max wait timeout for synchronization tools
 MAX_WAIT_TIMEOUT: float = 60.0

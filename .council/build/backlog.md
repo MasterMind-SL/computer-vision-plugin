@@ -1,206 +1,167 @@
-# Implementation Backlog: Desktop Computer Vision Plugin
+# Implementation Backlog: CV MCP Plugin — Definitive Tool Upgrade
 
 ## Foundation Tasks (Team Lead — must complete before parallel work)
 
-### F-1. Project scaffold [S]
-- Create full directory structure: `src/`, `src/tools/`, `src/utils/`, `tests/`, `tests/unit/`, `tests/integration/`, `tests/benchmarks/`, `.claude-plugin/`, `skills/cv-setup/`, `skills/cv-help/`
-- Create ALL `__init__.py` files: `src/__init__.py`, `src/tools/__init__.py`, `src/utils/__init__.py`, `tests/__init__.py`, `tests/unit/__init__.py`, `tests/integration/__init__.py`, `tests/benchmarks/__init__.py`
-- Create `pyproject.toml` with all dependencies (mcp>=1.26.0, mss>=9.0.0, pywin32>=306, Pillow>=10.0.0, winocr>=0.2.0, comtypes>=1.4.0, pydantic>=2.0.0) + dev extras (pytest, ruff, mypy)
-- Create `.claude-plugin/plugin.json` (name: "computer-vision", version: "1.0.0")
-- Create `.mcp.json` (command: `uv run --directory ${CLAUDE_PLUGIN_ROOT} python -m src`, NOT `python -m src.server`)
-- Create `CLAUDE.md` with project overview, coding conventions (Pydantic BaseModel for all models, structured error responses, no HTTP transport), import patterns, testing instructions
+### F-1. Update `src/models.py` — Add new models, enhance OcrRegion [M]
+- Add `OcrWord(BaseModel)`: `text: str`, `bbox: Rect`, `confidence: float = 0.0`
+- Add `FindMatch(BaseModel)`: `text: str`, `bbox: Rect`, `confidence: float`, `source: str`, `ref_id: str`, `control_type: str | None = None`
+- Enhance `OcrRegion`: add `words: list[OcrWord] = Field(default_factory=list)` field, add `confidence: float = 0.0` default
+- Add `validate_hwnd(hwnd: int) -> int` helper: validate `0 < hwnd <= 0xFFFFFFFF`
+- **No breaking changes** — all additions are additive
 
-### F-2. Cross-cutting modules (full implementation) [M]
-- `src/errors.py` — Error code constants (WINDOW_NOT_FOUND, WINDOW_MINIMIZED, ACCESS_DENIED, SCREEN_LOCKED, TIMEOUT, INVALID_COORDINATES, OCR_UNAVAILABLE, RATE_LIMITED, DRY_RUN) + `make_error(code, message)` factory + `make_success(**payload)` factory
-- `src/models.py` — Pydantic BaseModel classes (NOT dataclasses): `WindowInfo`, `MonitorInfo`, `ScreenshotResult`, `OcrRegion`, `UiaElement`, `Rect`, `Point`, `ClickParams`, `KeyboardParams`
-- `src/config.py` — Settings from env vars with defaults: CV_RESTRICTED_PROCESSES (default: "credential manager,keepass,1password,bitwarden,windows security"), CV_DRY_RUN, CV_DEFAULT_MAX_WIDTH (1280), CV_MAX_TEXT_LENGTH (1000), CV_RATE_LIMIT (20), CV_AUDIT_LOG_PATH, CV_OCR_REDACTION_PATTERNS
-- `src/dpi.py` — `init_dpi_awareness()` via ctypes SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2), `get_monitor_dpi(hmonitor)`, `physical_to_logical()`, `logical_to_physical()`
-- `src/coordinates.py` — `to_screen_absolute(x, y, hwnd)`, `to_window_relative(x, y, hwnd)`, `normalize_for_sendinput(x, y)` (0-65535 range), `validate_coordinates(x, y)` against virtual desktop bounds
+### F-2. Update `src/errors.py` — Add new error codes [S]
+- Add `FIND_NO_MATCH = "FIND_NO_MATCH"` — informational code for cv_find with 0 results
+- Add `OCR_LOW_CONFIDENCE = "OCR_LOW_CONFIDENCE"` — when average confidence < 0.7
 
-### F-3. Security utilities (full implementation) [M]
-- `src/utils/security.py` — `check_restricted(pid, process_name)`, `validate_hwnd_fresh(hwnd, expected_pid, expected_title)` (TOCTOU prevention), `check_rate_limit(tool_name)` (token bucket, 20/sec), `log_action(tool, params, result)` (JSON lines to audit.jsonl, text logged as `[TEXT len=N]`), `guard_dry_run(tool, params)` decorator, `redact_ocr_output(text, regions, patterns)` for OCR redaction
-- File: creates/rotates audit log at `%LOCALAPPDATA%/claude-cv-plugin/audit.jsonl`
+### F-3. Update `src/config.py` — Add PII redaction patterns [S]
+- Add `CV_OCR_REDACTION_PATTERNS` default: SSN pattern (`\b\d{3}-\d{2}-\d{4}\b`), credit card pattern (`\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b`)
+- Loaded from env var with sensible defaults, same pattern as existing config vars
 
-### F-4. Utility module stubs (full signatures, type hints, docstrings, `pass` bodies) [M]
-- `src/utils/screenshot.py` — `capture_window(hwnd: int, max_width: int = 1280) -> ScreenshotResult`, `capture_desktop(max_width: int = 1920) -> ScreenshotResult`, `capture_region(x0: int, y0: int, x1: int, y1: int) -> ScreenshotResult`, `encode_image(img: Image.Image, max_width: int, fmt: str) -> str`
-- `src/utils/win32_input.py` — INPUT/MOUSEINPUT/KEYBDINPUT ctypes struct definitions, `send_mouse_click(x, y, button, click_type)`, `send_mouse_drag(start_x, start_y, end_x, end_y, button)`, `type_unicode_string(text: str)`, `send_key_combo(keys: str)`, VK code lookup table
-- `src/utils/win32_window.py` — `enum_windows(include_children: bool = False) -> list[WindowInfo]`, `get_window_info(hwnd: int) -> WindowInfo`, `focus_window(hwnd: int) -> bool`, `move_window(hwnd: int, x, y, w, h) -> Rect`, `is_window_valid(hwnd: int) -> bool`
-- `src/utils/uia.py` — `init_uia() -> CUIAutomation`, `get_ui_tree(hwnd: int, depth: int = 5, filter: str = "all") -> list[UiaElement]`
+### F-4. Update `src/utils/security.py` — HWND validation + redaction update [M]
+- Add `validate_hwnd_range(hwnd: int)` that checks `0 < hwnd <= 0xFFFFFFFF` before any Win32 call
+- Update `redact_ocr_output()` to accept `list[OcrRegion]` (Pydantic models) in addition to `list[dict]` — must handle both for backward compatibility during transition
+- Apply `CV_OCR_REDACTION_PATTERNS` from config to both `text` and `regions[].text` and `regions[].words[].text`
 
-### F-5. FastMCP server with auto-registration [S]
-- `src/server.py` — Create `FastMCP("computer-vision")` instance. Auto-import all tool modules from `src/tools/` so agents never need to edit server.py. Each tool file defines functions with `@mcp.tool()` decorators on the shared FastMCP instance imported from server.py.
-- `src/__main__.py` — Import and call `dpi.init_dpi_awareness()`, then import `server.mcp` and call `mcp.run(transport="stdio")`. This is the entry point (`.mcp.json` runs `python -m src`).
-- Verify: `uv run python -m src` starts and responds to MCP `initialize`.
+### F-5. Update `src/utils/uia.py` — Expose IsPassword and Value properties [M]
+- When walking UIA tree elements, read `UIA_IsPasswordPropertyId` and include `is_password: bool` in element data
+- For Edit/Document control types, attempt to read `CurrentValue` via the Value pattern (`IUIAutomationValuePattern`). Include `value: str | None` in element data
+- If `IsPassword` is True, redact the value as `[PASSWORD]` in the returned element
+- These are required by cv_get_text (Workstream C) for accurate text extraction and password protection
 
-### F-6. Skill files [S]
-- `skills/cv-setup/SKILL.md` — Setup instructions: check uv, run uv sync, verify MCP server starts
-- `skills/cv-help/SKILL.md` — Usage guide: list all 14 tools with brief descriptions and examples
-
-### F-7. Test scaffolding [S]
-- `tests/conftest.py` — Shared fixtures: mock HWND values, mock MonitorInfo list, sample PIL images, temp directories, mock security config
-- Pytest config in `pyproject.toml`
-
-**SYNC POINT SP-0:** All workstreams begin after F-5 passes smoke test (server starts, responds to MCP initialize).
+**SYNC POINT SP-0:** All workstreams begin after Foundation tasks complete. dev-alpha can start immediately after F-1 and F-4 are done (does not need F-5).
 
 ---
 
-## Workstream A: Windows, Monitors & Capture (dev-alpha)
-**Features: F1, F2, F3, F4, F5, F9, F11**
+## Workstream A: OcrEngine + OCR Tool Refactor (dev-alpha)
+**Features: F1 (Fix OCR Bounding Boxes) + F2 (Improve OCR Accuracy)**
+**Dependencies: F-1 (models), F-3 (config), F-4 (security)**
 
-### A-1. `utils/win32_window.py` full implementation [M]
-- Replace stubs with real pywin32 calls: EnumWindows callback, GetWindowText, GetWindowRect, GetWindowThreadProcessId, GetClassName, MonitorFromWindow, OpenProcess + GetModuleFileNameEx for process name
-- EnumChildWindows support for `include_children=True`
-- `is_window_valid(hwnd)` using IsWindow
-- **Creates:** `src/utils/win32_window.py` (full)
+### A-1. Create `src/utils/ocr_engine.py` — OcrEngine class [L]
+- **OcrEngine class** (module-level singleton, lazy init):
+  - `__init__()`: Detect installed OCR languages via `winocr.list_available_languages()`, cache as `_installed_langs`. Build preference order: `en-US` > `en-*` > other installed languages.
+  - `recognize(image: PIL.Image, lang: str | None = None, preprocess: bool = True, origin: Point | None = None) -> dict`: Main pipeline — preprocess → OCR → extract regions → translate coordinates → return structured result.
+  - `preprocess_image(image: PIL.Image) -> PIL.Image`: Pipeline: (1) upscale 2x via LANCZOS if height < 300px, (2) convert to grayscale "L", (3) `ImageFilter.SHARPEN`, (4) `ImageOps.autocontrast`.
+  - `_select_language(lang: str | None) -> str`: If `lang` provided, validate against installed. If None, use cached preference order.
+  - `_extract_regions_winocr(result, origin) -> list[OcrRegion]`: Iterate `line.words`, extract `word.bounding_rect` (x, y, width, height), compute line bbox as union of word bboxes, build `OcrWord` objects, translate coords with origin offset.
+  - `_extract_regions_pytesseract(data, origin) -> list[OcrRegion]`: Use `image_to_data(output_type=Output.DICT)` for word-level bboxes and confidence.
+- **Origin offset**: When `origin` provided, all bbox coords translated: `x += origin.x`, `y += origin.y`
+- **Confidence**: Per-word from winocr word objects, per-line as average of word confidences, overall as average of line confidences
+- **Critical**: This is a NEW utility file — does NOT modify `src/tools/ocr.py` yet. Must be independently testable.
 
-### A-2. `utils/screenshot.py` full implementation [M]
-- mss capture: window (crop by rect), desktop (full virtual screen), region (explicit coords)
-- PrintWindow fallback for occluded/off-screen windows via pywin32
-- Pillow downscaling to max_width maintaining aspect ratio
-- Base64 PNG encoding (and optional JPEG with quality param)
-- Return PIL Image internally for OCR consumption, base64 only at MCP boundary
-- DPI metadata in ScreenshotResult
-- **Creates:** `src/utils/screenshot.py` (full)
+### A-2. Refactor `src/tools/ocr.py` — Delegate to OcrEngine [L]
+- Replace inline `_ocr_winocr()` and `_ocr_pytesseract()` with calls to `OcrEngine.recognize()`
+- Add new parameters: `lang: str | None = None`, `preprocess: bool = True`
+- Compute `origin` from `win32gui.GetWindowRect(hwnd)` when hwnd provided, or `Point(x=x0, y=y0)` for region capture
+- For hwnd capture: use `capture_window_raw(hwnd)` at native resolution (no max_width downscaling) for OCR clarity
+- Return enhanced schema: existing `text`, `regions`, `engine` fields PLUS new `confidence` (float), `language` (str), `origin` (Point dict)
+- `regions` now populated with real `OcrRegion` Pydantic models (bbox, confidence, words all filled)
+- **Backward compatibility**: ALL existing fields preserved. New fields additive only.
+- Apply `redact_ocr_output()` from security.py to all output before returning
 
-### A-3. F11 — `tools/monitors.py` [M]
-- `cv_list_monitors()`: EnumDisplayMonitors + GetMonitorInfo + GetDpiForMonitor
-- Return list of MonitorInfo (index, name, rect, work_area, dpi, scale_factor, is_primary)
-- Cross-reference with mss monitors for validation
-- **Creates:** `src/tools/monitors.py`
+### A-3. Add security gates to `cv_ocr` [M]
+- **Critical security fix**: cv_ocr currently has ZERO security gates
+- When `hwnd` is provided: call `validate_hwnd_fresh(hwnd)` + `check_restricted(process_name)` + `log_action("cv_ocr", params, status)`
+- Read-only tool: does NOT need `check_rate_limit` or `guard_dry_run`
+- Same pattern as `cv_read_ui` in `src/tools/accessibility.py`
 
-### A-4. F1 — `tools/windows.py` (cv_list_windows) [M]
-- `cv_list_windows(include_children: bool = False)`: calls utils/win32_window.py
-- Filter to visible top-level windows, return list of WindowInfo
-- **Creates:** `src/tools/windows.py` (partial — F1 only)
+### A-4. Create `tests/unit/test_ocr_engine.py` [M]
+- Test language caching: mock `list_available_languages()` → verify `en-US` preferred over `es-MX`
+- Test preprocessing pipeline: feed image → verify grayscale + sharpen + contrast applied, verify 2x upscale for small images
+- Test bbox extraction from winocr: mock winocr result with known `word.bounding_rect` values → verify line-level union bbox is correct
+- Test origin offset: known window at (500, 300), OCR bbox (50, 20) → verify screen-absolute (550, 320)
+- Test pytesseract bbox extraction: mock `image_to_data` → verify OcrRegion populated correctly
+- Test confidence aggregation: word confidences → line average → overall average
 
-### A-5. F5 — `tools/windows.py` (cv_focus_window) [M]
-- `cv_focus_window(hwnd: int)`: ShowWindow(SW_RESTORE) if minimized, AttachThreadInput + SetForegroundWindow + detach
-- Security gate: check restricted process, validate HWND freshness, log action
-- **Modifies:** `src/tools/windows.py` (adds F5)
+### A-5. Create `tests/unit/test_ocr_bbox.py` [M]
+- Specific regression tests for the bbox bug fix
+- Mock winocr result with realistic word bounding_rects → verify every region has non-empty bbox
+- Test edge cases: single-word line, empty line, very long line
+- Test that OcrRegion Pydantic model rejects empty bbox (validation)
+- Test coordinate translation with various window positions
 
-### A-6. F9 — `tools/windows.py` (cv_move_window) [M]
-- `cv_move_window(hwnd, x, y, width, height, action)`: MoveWindow for position/size, ShowWindow for maximize/minimize/restore
-- Security gate: check restricted, validate HWND, log action
-- **Modifies:** `src/tools/windows.py` (adds F9)
-
-### A-7. F2 — `tools/capture.py` (cv_screenshot_window) [L]
-- `cv_screenshot_window(hwnd: int, max_width: int = 1280)`: calls utils/screenshot.py
-- mss primary, PrintWindow fallback
-- Returns base64 PNG + metadata (rect, physical_res, logical_res, dpi_scale)
-- **Creates:** `src/tools/capture.py` (partial — F2)
-
-### A-8. F3 — `tools/capture.py` (cv_screenshot_desktop) [S]
-- `cv_screenshot_desktop(max_width: int = 1920, quality: int = 95)`: mss full virtual screen
-- **Modifies:** `src/tools/capture.py` (adds F3)
-
-### A-9. F4 — `tools/capture.py` (cv_screenshot_region) [S]
-- `cv_screenshot_region(x0, y0, x1, y1)`: mss explicit region, validate coordinates
-- **Modifies:** `src/tools/capture.py` (adds F4)
-
-### A-10. Unit tests for Workstream A [M]
-- `tests/unit/test_windows.py` — mock EnumWindows, GetWindowText, focus/move
-- `tests/unit/test_capture.py` — mock mss, PrintWindow, image encoding
-- `tests/unit/test_monitors.py` — mock EnumDisplayMonitors, GetMonitorInfo
-- **Creates:** 3 test files
-
-**SYNC POINT SP-1:** After A-2 completes, notify WS-B that screenshot utility is ready for OCR (F10).
+**SYNC POINT SP-1:** After A-1 completes, notify dev-beta and dev-gamma that OcrEngine is available. They can begin their workstreams.
 
 ---
 
-## Workstream B: Input & OCR (dev-beta)
-**Features: F6, F7, F8, F10**
+## Workstream B: cv_find — Natural Language Element Finder (dev-beta)
+**Feature: F3 (cv_find)**
+**Dependencies: F-1 (models), F-4 (security), A-1 (OcrEngine)**
+**BLOCKED BY SP-1** (needs OcrEngine from Workstream A)
 
-### B-1. `utils/win32_input.py` full implementation [M]
-- Replace stubs with ctypes struct definitions: INPUT, MOUSEINPUT, KEYBDINPUT
-- `send_mouse_click(x, y, button, click_type)`: normalize coords to 0-65535, build INPUT array, SendInput
-- `send_mouse_drag(start_x, start_y, end_x, end_y, button)`: move + button_down + move + button_up
-- `type_unicode_string(text)`: KEYEVENTF_UNICODE for each char, batch into single SendInput
-- `send_key_combo(keys)`: parse "ctrl+shift+s" → VK codes, build modifier-down + key-down + key-up + modifier-up, SendInput
-- VK code lookup table + VkKeyScanW for printable chars
-- **Creates:** `src/utils/win32_input.py` (full)
+### B-1. Create `src/tools/find.py` — cv_find tool [L]
+- **Signature**: `cv_find(query: str, hwnd: int, method: str = "auto", max_results: int = 20)`
+- **Security gates**: `validate_hwnd_fresh` + `check_restricted` + `log_action` (read-only, no rate limit)
+- **Input validation**: Cap `query` to 500 chars. Validate `max_results` in 1-50 range.
+- **UIA matching** (Tier 1, ~1-2s):
+  - Call `get_ui_tree(hwnd, depth=8, filter="all")`
+  - Flatten tree to list of `(name, control_type, rect, ref_id)`
+  - Fuzzy-match `query` against element `name` using `difflib.SequenceMatcher.ratio()` with threshold 0.5
+  - Also match against `control_type` for queries like "button", "edit", "checkbox"
+  - Also match against element `value` if available (from F-5 UIA enhancement)
+  - Sort by match score descending
+- **OCR matching** (Tier 2, ~3-5s):
+  - Capture window via `capture_window_raw(hwnd)` — no file round-trip
+  - Run `OcrEngine.recognize()` with preprocessing enabled
+  - Fuzzy-match `query` against OCR region text
+  - Bboxes already translated to screen-absolute by OcrEngine (via origin offset)
+- **Auto mode** (default, Tier 3):
+  - Run UIA first. If 0 results, run OCR. **SEQUENTIAL, NOT PARALLEL** (avoids ThreadPoolExecutor nesting with winocr's internal asyncio.run + uia.py threading)
+  - If both produce results, merge and deduplicate by bbox overlap (IoU > 0.5 → keep UIA result, higher reliability)
+- **Bbox validation**: Before returning, validate ALL bboxes fall within target `GetWindowRect(hwnd)`. Reject bboxes outside window bounds.
+- **Return format**: `{success, matches: [FindMatch], match_count, method_used}`
+- If 0 matches: return `{success: true, matches: [], match_count: 0}` (not an error)
 
-### B-2. F6 — `tools/input_mouse.py` [L]
-- `cv_mouse_click(x, y, button, click_type, hwnd, coordinate_space, start_x, start_y)`:
-- If coordinate_space == "window_relative": convert via coordinates.py
-- If hwnd provided: auto-focus window first (call focus_window)
-- Security gate: check restricted, validate HWND freshness, rate limit, log, dry_run
-- Support: left_click, right_click, double_click, middle_click, drag
-- **Creates:** `src/tools/input_mouse.py`
+### B-2. Create `tests/unit/test_find.py` [M]
+- Test UIA matching: mock UIA tree with "Submit" button → `cv_find("submit")` → match found with source="uia"
+- Test OCR fallback: mock empty UIA tree + OCR regions → verify OCR triggered, source="ocr"
+- Test auto mode: mock UIA with results → verify OCR NOT called
+- Test deduplication: overlapping UIA and OCR bboxes → verify UIA kept
+- Test bbox validation: return bbox outside window rect → verify rejected
+- Test max_results cap: 30 matches → verify only top 20 returned
+- Test query cap: 600-char query → verify truncated to 500
+- Test security gates: verify validate_hwnd + check_restricted + log_action called
 
-### B-3. F7 — `tools/input_keyboard.py` (cv_type_text) [M]
-- `cv_type_text(text: str)`: validate max 1000 chars, call type_unicode_string
-- Security gate: rate limit, log (text as `[TEXT len=N]`), dry_run
-- **Creates:** `src/tools/input_keyboard.py` (partial — F7)
-
-### B-4. F8 — `tools/input_keyboard.py` (cv_send_keys) [M]
-- `cv_send_keys(keys: str)`: parse key string, validate against allowed keys, call send_key_combo
-- Security gate: rate limit, log, dry_run
-- **Modifies:** `src/tools/input_keyboard.py` (adds F8)
-
-### B-5. F10 — `tools/ocr.py` [L]
-- `cv_ocr(hwnd, region, image_base64)`: capture screenshot (reuse utils/screenshot.py), run winocr primary (with sync wrapper + 5s timeout), pytesseract fallback
-- Return text + regions with bounding boxes + engine name
-- Call `security.redact_ocr_output()` before returning
-- **BLOCKED BY SP-1** (needs utils/screenshot.py from WS-A)
-- **Creates:** `src/tools/ocr.py`
-
-### B-6. Unit tests for Workstream B [M]
-- `tests/unit/test_input.py` — mock SendInput, test coordinate normalization, key parsing
-- `tests/unit/test_ocr.py` — mock winocr/pytesseract, test redaction, test bounding boxes
-- **Creates:** 2 test files
+### B-3. Create `tests/unit/test_fuzzy_match.py` [S]
+- Test SequenceMatcher edge cases: empty query, single char, Unicode (CJK, emoji), special chars
+- Test threshold boundary: ratio 0.49 → no match, ratio 0.51 → match
+- Test control_type matching: query "button" matches Button control type
+- Test case insensitivity in matching
+- Test substring matching: query "Sub" matches "Submit"
 
 ---
 
-## Workstream C: Accessibility, Sync & Integration (dev-gamma)
-**Features: F12, F13 + integration testing + final polish**
+## Workstream C: cv_get_text — Clean Text Extraction (dev-gamma)
+**Feature: F4 (cv_get_text)**
+**Dependencies: F-1 (models), F-4 (security), F-5 (UIA enhancements), A-1 (OcrEngine)**
+**BLOCKED BY SP-0 (Foundation) + SP-1 (OcrEngine)**
 
-### C-1. `utils/uia.py` full implementation [M]
-- Replace stubs with comtypes UIAutomationCore initialization
-- `init_uia()`: CoCreateInstance for CUIAutomation, cache instance
-- `get_ui_tree(hwnd, depth, filter)`: ElementFromHandle, CreateTreeWalker(CreateTrueCondition), recursive walk up to depth
-- For each element: CurrentName, CurrentControlType, CurrentBoundingRectangle, CurrentIsEnabled, GetCurrentPropertyValue(ValueValuePropertyId)
-- Filter "interactive": only Button, Edit, ComboBox, CheckBox, MenuItem, Link, Slider, Tab types
-- Hard timeout (5s) to handle unresponsive apps (comtypes COM can hang)
-- **Creates:** `src/utils/uia.py` (full)
+### C-1. Create `src/tools/text_extract.py` — cv_get_text tool [L]
+- **Signature**: `cv_get_text(hwnd: int, method: str = "auto")`
+- **Security gates**: `validate_hwnd_fresh` + `check_restricted` + `log_action` (read-only)
+- **UIA text extraction** (primary, ~1-2s):
+  - Call `get_ui_tree(hwnd, depth=10, filter="all")`
+  - Collect elements with non-empty `name` and `control_type` in `{Text, Edit, Document, ListItem, DataItem}`
+  - For Edit/Document types: also collect `value` property (from F-5 UIA enhancement)
+  - **Password detection**: Check `is_password` property from UIA. Redact value as `[PASSWORD]`
+  - **Spatial sorting**: Sort by `(rect.y // 20, rect.x)` — groups into rows by y-proximity, left-to-right within rows
+  - Join with newlines; insert double newline for large y-gaps (> 40px) as paragraph breaks
+- **OCR fallback** (~3-5s):
+  - Triggers when UIA text < 20 chars (common for Chrome/Electron)
+  - Capture window via `capture_window_raw(hwnd)`, run `OcrEngine.recognize()` with preprocessing
+  - Sort OCR regions spatially same as UIA path
+- **Redaction**: Apply `CV_OCR_REDACTION_PATTERNS` to ALL output text (both UIA and OCR paths)
+- **Return format**: `{success, text, source, line_count, confidence}`
+  - `source`: "uia", "ocr", or "hybrid"
+  - `confidence`: 1.0 for UIA, average word confidence for OCR
 
-### C-2. F12 — `tools/accessibility.py` [L]
-- `cv_read_ui(hwnd: int, depth: int = 5, filter: str = "all")`: calls utils/uia.py
-- Return structured element tree with ref_id, name, control_type, rect, value, is_enabled, is_interactive
-- Security gate: check restricted process for target window
-- **Creates:** `src/tools/accessibility.py`
-
-### C-3. F13 — `tools/synchronization.py` [M]
-- `cv_wait_for_window(title_pattern: str, timeout: float = 10.0)`: poll EnumWindows every 250ms, regex match on title, return on match or timeout
-- `cv_wait(seconds: float)`: asyncio.sleep, capped at 30s max
-- **Creates:** `src/tools/synchronization.py`
-
-### C-4. Unit tests for Workstream C [M]
-- `tests/unit/test_accessibility.py` — mock comtypes UIA, test tree walking, depth limiting, interactive filter
-- `tests/unit/test_synchronization.py` — mock EnumWindows, test timeout behavior, regex matching
-- `tests/unit/test_security.py` — test restricted process check, rate limiting, HWND freshness, dry_run, redaction
-- `tests/unit/test_dpi.py` — test coordinate transforms, DPI scaling math
-- `tests/unit/test_coordinates.py` — test window_relative/screen_absolute conversions
-- `tests/unit/test_models.py` — test Pydantic validation edge cases, serialization
-- `tests/unit/test_config.py` — test env var loading, defaults
-- **Creates:** 7 test files
-
-### C-5. Integration tests [L]
-- **BLOCKED BY SP-2** (all WS-A and WS-B feature tasks complete)
-- `tests/integration/test_full_workflow.py` — enumerate → find Notepad → capture → OCR → focus → type → send Ctrl+A → verify
-- `tests/integration/test_multi_monitor.py` — monitor enumeration, cross-monitor capture
-- `tests/integration/test_security.py` — restricted process blocking, rate limiting, dry-run mode
-- **Creates:** 3 integration test files
-
-### C-6. CLAUDE.md & skill docs finalization [S]
-- Complete `CLAUDE.md` with all 14 tool descriptions, usage examples, coding conventions
-- Finalize `skills/cv-setup/SKILL.md` and `skills/cv-help/SKILL.md` with full content
-
-### C-7. Final smoke test & polish [M]
-- Full server startup verification: all 14 tools registered
-- MCP protocol compliance check
-- Audit log verification (actions logged, text sanitized)
-- Dry-run mode validation
-- Run unit tests, report coverage
+### C-2. Create `tests/unit/test_text_extract.py` [M]
+- Test UIA text extraction: mock UIA tree with Text/Edit elements → verify text collected
+- Test spatial sorting: elements at various y/x positions → verify top-to-bottom, left-to-right order
+- Test paragraph breaks: elements with large y-gap → verify double newline inserted
+- Test password redaction: UIA element with `is_password=True` → verify value redacted as `[PASSWORD]`
+- Test OCR fallback: mock UIA returning < 20 chars → verify OCR triggered
+- Test PII redaction: text containing SSN pattern → verify redacted
+- Test security gates: verify validate_hwnd + check_restricted + log_action called
 
 ---
 
@@ -208,34 +169,50 @@
 
 | Point | Trigger | Unblocks |
 |-------|---------|----------|
-| **SP-0** | Foundation F-5 passes (server starts, MCP initialize works) | WS-A, WS-B, WS-C all begin |
-| **SP-1** | WS-A task A-2 completes (utils/screenshot.py ready) | WS-B task B-5 (OCR) |
-| **SP-2** | WS-A all feature tasks + WS-B all feature tasks complete | WS-C tasks C-5, C-6, C-7 (integration) |
+| **SP-0** | Foundation tasks F-1 through F-5 complete | Workstream A begins; C can begin UIA-dependent prep |
+| **SP-1** | Workstream A task A-1 complete (OcrEngine ready) | Workstream B (cv_find) + Workstream C (cv_get_text OCR fallback) |
+| **SP-2** | All workstream feature tasks complete | Post-integration testing |
+
+---
+
+## Post-Integration Tasks (Team Lead — after all workstreams complete)
+
+### P-1. Create `tests/unit/test_security_gates.py` [M]
+- Verify cv_ocr now has security gates (was missing before upgrade)
+- Verify cv_find has security gates (validate_hwnd + check_restricted + log_action)
+- Verify cv_get_text has security gates
+- Verify HWND range validation on all tools
+- Verify PII redaction applied to all text output paths
+
+### P-2. Integration verification [M]
+- Run full test suite: `uv run pytest tests/unit/ -v`
+- Verify server starts and all 16 tools registered (14 existing + cv_find + cv_get_text)
+- Verify cv_ocr backward compatibility: existing fields unchanged, new fields additive
+- Verify OcrEngine singleton works across multiple tool calls
+- Fix any import errors or integration issues
+
+---
 
 ## Complexity Summary
 
 | Size | Count | Tasks |
 |------|-------|-------|
-| Small (S) | 5 | F-1, F-6, F-7, A-8, A-9 |
-| Medium (M) | 16 | F-2, F-3, F-4, F-5, A-1, A-2, A-3, A-4, A-5, A-6, A-10, B-1, B-3, B-4, B-6, C-1, C-3, C-4, C-6, C-7 |
-| Large (L) | 5 | A-7, B-2, B-5, C-2, C-5 |
+| Small (S) | 3 | F-2, F-3, B-3 |
+| Medium (M) | 9 | F-1, F-4, F-5, A-3, A-4, A-5, B-2, C-2, P-1, P-2 |
+| Large (L) | 4 | A-1, A-2, B-1, C-1 |
 
 ## Feature Coverage Verification
 
-| Feature | Workstream | Task(s) |
-|---------|-----------|---------|
-| F1 Window Enumeration | A | A-1, A-4 |
-| F2 Screenshot Window | A | A-2, A-7 |
-| F3 Screenshot Desktop | A | A-2, A-8 |
-| F4 Region Capture | A | A-2, A-9 |
-| F5 Window Focus | A | A-5 |
-| F6 Mouse Click | B | B-1, B-2 |
-| F7 Type Text | B | B-1, B-3 |
-| F8 Send Keys | B | B-1, B-4 |
-| F9 Window Resize/Move | A | A-6 |
-| F10 OCR | B | B-5 |
-| F11 Multi-Monitor | A | A-3 |
-| F12 UI Accessibility | C | C-1, C-2 |
-| F13 Wait/Sync | C | C-3 |
+| PRD Feature | Workstream | Task(s) |
+|-------------|-----------|---------|
+| F1: Fix OCR Bounding Boxes | A | A-1 (OcrEngine bbox extraction), A-2 (OCR tool refactor), A-5 (bbox tests) |
+| F2: Improve OCR Accuracy | A | A-1 (lang cache, preprocessing, confidence), A-2 (lang/preprocess params), A-4 (engine tests) |
+| F3: cv_find Element Finder | B | B-1 (find tool), B-2 (find tests), B-3 (fuzzy match tests) |
+| F4: cv_get_text Extraction | C | C-1 (text extract tool), C-2 (text extract tests) |
+| Security: cv_ocr gates | A | A-3 (security gates on cv_ocr) |
+| Security: HWND validation | Foundation | F-4 (HWND range validation) |
+| Security: PII redaction | Foundation | F-3 (config patterns), F-4 (redaction update) |
+| Security: Password detection | Foundation + C | F-5 (UIA IsPassword), C-1 (redaction in cv_get_text) |
+| Security: All new tools gated | Post-Integration | P-1 (security gate verification) |
 
-**All 13 PRD features assigned. Zero deferrals.**
+**All 4 PRD features + all security requirements assigned. Zero deferrals.**

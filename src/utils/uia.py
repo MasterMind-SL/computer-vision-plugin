@@ -30,6 +30,15 @@ INTERACTIVE_CONTROL_TYPES: set[int] = {
     50019,  # Tab
 }
 
+# Control types that may hold text values via Value pattern
+VALUE_CONTROL_TYPES: set[int] = {
+    50004,  # Edit
+    50030,  # Document
+}
+
+# UIA property IDs
+UIA_IS_PASSWORD_PROPERTY_ID = 30019
+
 # Human-readable control type names
 CONTROL_TYPE_NAMES: dict[int, str] = {
     50000: "Button",
@@ -240,6 +249,30 @@ def _walk_children(
             is_interactive = control_type_id in INTERACTIVE_CONTROL_TYPES
             control_type_name = CONTROL_TYPE_NAMES.get(control_type_id, f"Unknown({control_type_id})")
 
+            # Check IsPassword property
+            is_password = False
+            try:
+                is_password = bool(
+                    child.GetCurrentPropertyValue(UIA_IS_PASSWORD_PROPERTY_ID)
+                )
+            except Exception:
+                pass
+
+            # Try to get Value from Value pattern for Edit/Document controls
+            value = None
+            if control_type_id in VALUE_CONTROL_TYPES:
+                try:
+                    # IUIAutomationValuePattern interface ID = 10002
+                    value_pattern = child.GetCurrentPattern(10002)
+                    if value_pattern is not None:
+                        raw_value = value_pattern.CurrentValue
+                        if is_password:
+                            value = "[PASSWORD]"
+                        elif raw_value:
+                            value = str(raw_value)
+                except Exception:
+                    pass
+
             # Recurse into children regardless of filter
             children = _walk_children(
                 walker, child, remaining_depth - 1, counter, interactive_only
@@ -255,10 +288,11 @@ def _walk_children(
                     name=name,
                     control_type=control_type_name,
                     rect=rect,
-                    value=None,
+                    value=value,
                     is_enabled=is_enabled,
                     is_interactive=is_interactive,
                     children=children,
+                    is_password=is_password,
                 )
                 elements.append(element)
 

@@ -1,4 +1,4 @@
-"""MCP tool for OCR text extraction using winocr (primary) with pytesseract fallback."""
+"""MCP tool for OCR text extraction using OcrEngine (winocr primary, pytesseract fallback)."""
 
 from __future__ import annotations
 
@@ -10,111 +10,16 @@ from typing import Any
 from PIL import Image
 
 from src.server import mcp
-from src.errors import make_error, make_success, OCR_UNAVAILABLE, INVALID_INPUT, CAPTURE_FAILED
+from src.errors import (
+    make_error, make_success,
+    OCR_UNAVAILABLE, INVALID_INPUT, CAPTURE_FAILED, WINDOW_NOT_FOUND,
+)
 from src.utils.security import redact_ocr_output
 from src.utils.screenshot import capture_window_raw, capture_region_raw
+from src.utils.ocr_engine import get_engine
+from src.models import Point
 
 logger = logging.getLogger(__name__)
-
-
-def _ocr_winocr(image: Image.Image) -> tuple[str, list[dict[str, Any]]]:
-    """Run OCR using winocr (Windows built-in OCR via UWP API).
-
-    Returns (full_text, regions) where each region is {text, bbox}.
-    Raises ImportError or RuntimeError on failure.
-    """
-    import winocr
-    import asyncio
-
-    # Try OCR languages in preference order; the first that succeeds wins.
-    # Windows ships with locale-specific OCR packs (e.g. es-MX, pt-BR) and may
-    # not have en-US installed.  We try common languages until one works.
-    _LANGS = ["en", "es", "es-MX", "pt", "fr", "de", "it", "ja", "zh-Hans", "ko"]
-
-    async def _run(img, lang):
-        return await winocr.recognize_pil(img, lang=lang)
-
-    def _sync_run(img, lang):
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-        if loop and loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                return pool.submit(asyncio.run, _run(img, lang)).result()
-        else:
-            return asyncio.run(_run(img, lang))
-
-    result = None
-    for lang in _LANGS:
-        try:
-            result = _sync_run(image, lang)
-            logger.info("OCR succeeded with language: %s", lang)
-            break
-        except Exception:
-            continue
-
-    if result is None:
-        raise RuntimeError(
-            "No working OCR language found. Install a language pack: "
-            "Add-WindowsCapability -Online -Name 'Language.OCR~~~en-US~0.0.1.0'"
-        )
-
-    lines = result.lines if hasattr(result, "lines") else []
-    full_text_parts: list[str] = []
-    regions: list[dict[str, Any]] = []
-
-    for line in lines:
-        text = line.text if hasattr(line, "text") else str(line)
-        full_text_parts.append(text)
-
-        bbox_dict: dict[str, int] = {}
-        if hasattr(line, "x"):
-            bbox_dict = {"x": int(line.x), "y": int(line.y), "width": int(line.width), "height": int(line.height)}
-        elif hasattr(line, "bbox"):
-            b = line.bbox
-            if isinstance(b, dict):
-                bbox_dict = b
-            else:
-                bbox_dict = {"x": int(b[0]), "y": int(b[1]), "width": int(b[2]), "height": int(b[3])}
-
-        regions.append({"text": text, "bbox": bbox_dict})
-
-    full_text = "\n".join(full_text_parts)
-    return full_text, regions
-
-
-def _ocr_pytesseract(image: Image.Image) -> tuple[str, list[dict[str, Any]]]:
-    """Run OCR using pytesseract fallback.
-
-    Returns (full_text, regions).
-    Raises ImportError if pytesseract is not installed.
-    """
-    import pytesseract
-
-    data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
-    full_text_parts: list[str] = []
-    regions: list[dict[str, Any]] = []
-
-    n_boxes = len(data.get("text", []))
-    for i in range(n_boxes):
-        text = data["text"][i].strip()
-        if not text:
-            continue
-        full_text_parts.append(text)
-        regions.append({
-            "text": text,
-            "bbox": {
-                "x": data["left"][i],
-                "y": data["top"][i],
-                "width": data["width"][i],
-                "height": data["height"][i],
-            },
-        })
-
-    full_text = " ".join(full_text_parts)
-    return full_text, regions
 
 
 @mcp.tool()
@@ -125,6 +30,8 @@ def cv_ocr(
     x1: int | None = None,
     y1: int | None = None,
     image_base64: str | None = None,
+    lang: str | None = None,
+    preprocess: bool = True,
 ) -> dict:
     """Extract text from a screenshot using OCR.
 
@@ -141,9 +48,28 @@ def cv_ocr(
         x1: Right edge of region to capture.
         y1: Bottom edge of region to capture.
         image_base64: Base64-encoded image to OCR directly.
+        lang: OCR language tag (e.g. "en-US"). Auto-detected if not provided.
+        preprocess: Whether to apply image preprocessing for better accuracy.
     """
     try:
+        # Security gates for hwnd
+        if hwnd is not None:
+            from src.utils.security import (
+                validate_hwnd_fresh, validate_hwnd_range,
+                check_restricted, get_process_name_by_pid, log_action,
+            )
+            validate_hwnd_range(hwnd)
+            if not validate_hwnd_fresh(hwnd):
+                return make_error(WINDOW_NOT_FOUND, f"Window HWND={hwnd} no longer exists")
+            import win32gui
+            import win32process
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            process_name = get_process_name_by_pid(pid)
+            check_restricted(process_name)
+            log_action("cv_ocr", {"hwnd": hwnd, "lang": lang, "preprocess": preprocess}, "started")
+
         image: Image.Image | None = None
+        origin: Point | None = None
 
         # Resolve image source
         if image_base64:
@@ -154,11 +80,15 @@ def cv_ocr(
                 return make_error(INVALID_INPUT, f"Failed to decode base64 image: {e}")
 
         elif hwnd is not None:
+            import win32gui as _w32g
+            rect_tuple = _w32g.GetWindowRect(hwnd)
+            origin = Point(x=rect_tuple[0], y=rect_tuple[1])
             image = capture_window_raw(hwnd)
             if image is None:
                 return make_error(CAPTURE_FAILED, f"Failed to capture window HWND={hwnd}")
 
         elif all(v is not None for v in (x0, y0, x1, y1)):
+            origin = Point(x=x0, y=y0)
             image = capture_region_raw(x0, y0, x1, y1)
             if image is None:
                 return make_error(CAPTURE_FAILED, f"Failed to capture region ({x0},{y0})-({x1},{y1})")
@@ -168,43 +98,38 @@ def cv_ocr(
                 "Provide one of: image_base64, hwnd, or (x0, y0, x1, y1) region coordinates.",
             )
 
-        # Run OCR: try winocr first, then pytesseract fallback
-        engine = "winocr"
-        full_text = ""
-        regions: list[dict[str, Any]] = []
-
+        # Run OCR via OcrEngine
+        engine = get_engine()
         try:
-            full_text, regions = _ocr_winocr(image)
-        except ImportError:
-            logger.info("winocr not available, trying pytesseract fallback")
-            try:
-                full_text, regions = _ocr_pytesseract(image)
-                engine = "pytesseract"
-            except ImportError:
-                return make_error(
-                    OCR_UNAVAILABLE,
-                    "No OCR engine available. Install winocr (pip install winocr) or pytesseract.",
-                )
-        except Exception as e:
-            logger.warning("winocr failed (%s), trying pytesseract fallback", e)
-            try:
-                full_text, regions = _ocr_pytesseract(image)
-                engine = "pytesseract"
-            except ImportError:
-                return make_error(
-                    OCR_UNAVAILABLE,
-                    f"winocr failed ({e}) and pytesseract is not installed.",
-                )
-            except Exception as e2:
-                return make_error(OCR_UNAVAILABLE, f"Both OCR engines failed: winocr={e}, pytesseract={e2}")
+            result = engine.recognize(image, lang=lang, preprocess=preprocess, origin=origin)
+        except RuntimeError as e:
+            return make_error(OCR_UNAVAILABLE, str(e))
+
+        full_text: str = result["text"]
+        regions = result["regions"]
+        engine_name: str = result["engine"]
+        confidence: float = result["confidence"]
+        language: str = result["language"]
+        origin_dict = result["origin"]
+
+        # Serialize regions to dicts for redaction
+        region_dicts = [r.model_dump() for r in regions]
 
         # Apply redaction
-        full_text, regions = redact_ocr_output(full_text, regions)
+        full_text, region_dicts = redact_ocr_output(full_text, region_dicts)
+
+        # Log completion for hwnd
+        if hwnd is not None:
+            from src.utils.security import log_action
+            log_action("cv_ocr", {"hwnd": hwnd, "lang": lang, "preprocess": preprocess}, "completed")
 
         return make_success(
             text=full_text,
-            regions=regions,
-            engine=engine,
+            regions=region_dicts,
+            engine=engine_name,
+            confidence=confidence,
+            language=language,
+            origin=origin_dict,
         )
 
     except Exception as e:

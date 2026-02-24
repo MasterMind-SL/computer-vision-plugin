@@ -54,11 +54,19 @@ class ScreenshotResult(BaseModel):
     format: str = "png"
 
 
+class OcrWord(BaseModel):
+    """A single OCR-detected word with bounding box."""
+    text: str
+    bbox: Rect
+    confidence: float = 0.0
+
+
 class OcrRegion(BaseModel):
     """A single OCR-detected text region."""
     text: str
     bbox: Rect
     confidence: float = 0.0
+    words: list[OcrWord] = Field(default_factory=list)
 
 
 class OcrResult(BaseModel):
@@ -66,6 +74,23 @@ class OcrResult(BaseModel):
     text: str
     regions: list[OcrRegion] = Field(default_factory=list)
     engine: str = "winocr"
+
+
+class FindMatch(BaseModel):
+    """A single match from cv_find."""
+    text: str
+    bbox: Rect
+    confidence: float
+    source: str  # "uia" or "ocr"
+    ref_id: str
+    control_type: str | None = None
+
+
+def validate_hwnd(hwnd: int) -> int:
+    """Validate HWND is within valid Win32 range."""
+    if not (0 < hwnd <= 0xFFFFFFFF):
+        raise ValueError(f"Invalid HWND: {hwnd}")
+    return hwnd
 
 
 class UiaElement(BaseModel):
@@ -77,6 +102,7 @@ class UiaElement(BaseModel):
     value: str | None = None
     is_enabled: bool = True
     is_interactive: bool = False
+    is_password: bool = False
     children: list[UiaElement] = Field(default_factory=list)
 
 
