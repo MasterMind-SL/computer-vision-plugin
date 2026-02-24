@@ -26,6 +26,11 @@ MOUSEEVENTF_MIDDLEDOWN = 0x0020
 MOUSEEVENTF_MIDDLEUP = 0x0040
 MOUSEEVENTF_ABSOLUTE = 0x8000
 MOUSEEVENTF_VIRTUALDESK = 0x4000
+MOUSEEVENTF_WHEEL = 0x0800
+MOUSEEVENTF_HWHEEL = 0x1000
+
+# Wheel delta constant — one "notch" of scroll
+WHEEL_DELTA = 120
 
 # Keyboard event flags
 KEYEVENTF_EXTENDEDKEY = 0x0001
@@ -116,7 +121,7 @@ class MOUSEINPUT(ctypes.Structure):
     _fields_ = [
         ("dx", ctypes.c_long),
         ("dy", ctypes.c_long),
-        ("mouseData", ctypes.c_ulong),
+        ("mouseData", ctypes.c_long),
         ("dwFlags", ctypes.c_ulong),
         ("time", ctypes.c_ulong),
         ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
@@ -322,6 +327,40 @@ def send_key_combo(keys: str) -> bool:
     sent = _send_inputs(inputs)
     logger.debug("send_key_combo: sent %d/%d events for '%s'", sent, len(inputs), keys)
     return sent == len(inputs)
+
+
+def send_mouse_scroll(x: int, y: int, direction: str, amount: int = 3) -> bool:
+    """Send mouse scroll at normalized coordinates (0-65535 range).
+
+    Args:
+        x: Normalized X coordinate (0-65535).
+        y: Normalized Y coordinate (0-65535).
+        direction: "up", "down", "left", or "right".
+        amount: Number of scroll notches (each = WHEEL_DELTA = 120).
+
+    Returns:
+        True if SendInput succeeded.
+    """
+    base_flags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE
+
+    if direction in ("up", "down"):
+        wheel_flag = MOUSEEVENTF_WHEEL
+        # Positive = scroll up, negative = scroll down
+        delta = amount * WHEEL_DELTA if direction == "up" else -(amount * WHEEL_DELTA)
+    else:
+        wheel_flag = MOUSEEVENTF_HWHEEL
+        # Positive = scroll right, negative = scroll left
+        delta = amount * WHEEL_DELTA if direction == "right" else -(amount * WHEEL_DELTA)
+
+    inp = INPUT(type=INPUT_MOUSE)
+    inp.union.mi.dx = x
+    inp.union.mi.dy = y
+    inp.union.mi.mouseData = delta
+    inp.union.mi.dwFlags = base_flags | wheel_flag
+
+    sent = _send_inputs([inp])
+    logger.debug("send_mouse_scroll: sent %d/1 events at (%d, %d) direction=%s amount=%d", sent, x, y, direction, amount)
+    return sent == 1
 
 
 def _send_inputs(inputs: list[INPUT]) -> int:

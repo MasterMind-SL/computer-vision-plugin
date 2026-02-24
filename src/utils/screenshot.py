@@ -339,6 +339,9 @@ def _cleanup_old_screenshots() -> None:
         pass  # best-effort cleanup
 
 
+_cleanup_call_count: int = 0
+
+
 def save_image(img: Image.Image, max_width: int = 1280, fmt: str = "png") -> str:
     """Downscale and save a PIL Image to a temp file.
 
@@ -350,7 +353,10 @@ def save_image(img: Image.Image, max_width: int = 1280, fmt: str = "png") -> str
     Returns:
         Absolute file path to the saved image.
     """
-    _cleanup_old_screenshots()
+    global _cleanup_call_count
+    _cleanup_call_count += 1
+    if _cleanup_call_count % 10 == 0:
+        _cleanup_old_screenshots()
 
     if img.width > max_width:
         ratio = max_width / img.width

@@ -17,6 +17,7 @@ from src.utils.security import (
 )
 from src.utils.win32_input import send_mouse_click, send_mouse_drag
 from src.utils.win32_window import focus_window
+from src.utils.action_helpers import _capture_post_action, _build_window_state
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,8 @@ def cv_mouse_click(
     coordinate_space: str = "screen_absolute",
     start_x: int | None = None,
     start_y: int | None = None,
+    screenshot: bool = True,
+    screenshot_delay_ms: int = 150,
 ) -> dict:
     """Click, double-click, or drag the mouse at a screen position.
 
@@ -43,6 +46,8 @@ def cv_mouse_click(
         coordinate_space: "screen_absolute" or "window_relative" (requires hwnd).
         start_x: If provided along with start_y, performs a drag from (start_x, start_y) to (x, y).
         start_y: If provided along with start_x, performs a drag from (start_x, start_y) to (x, y).
+        screenshot: Whether to capture a screenshot after the action (default True, requires hwnd).
+        screenshot_delay_ms: Delay in milliseconds before capturing the post-action screenshot (default 150).
     """
     try:
         # Validate button
@@ -103,12 +108,21 @@ def cv_mouse_click(
             log_action("cv_mouse_click", params, "ok" if ok else "fail")
             if not ok:
                 return make_error(INPUT_FAILED, "SendInput failed for mouse drag.")
-            return make_success(
+            result = make_success(
                 action="drag",
                 start={"x": start_x, "y": start_y},
                 end={"x": x, "y": y},
                 button=button,
             )
+            if screenshot and hwnd:
+                image_path = _capture_post_action(hwnd, delay_ms=screenshot_delay_ms)
+                if image_path:
+                    result["image_path"] = image_path
+            if hwnd:
+                window_state = _build_window_state(hwnd)
+                if window_state:
+                    result["window_state"] = window_state
+            return result
         else:
             # Regular click
             if not validate_coordinates(x, y):
@@ -119,12 +133,21 @@ def cv_mouse_click(
             log_action("cv_mouse_click", params, "ok" if ok else "fail")
             if not ok:
                 return make_error(INPUT_FAILED, "SendInput failed for mouse click.")
-            return make_success(
+            result = make_success(
                 action="click",
                 position={"x": x, "y": y},
                 button=button,
                 click_type=click_type,
             )
+            if screenshot and hwnd:
+                image_path = _capture_post_action(hwnd, delay_ms=screenshot_delay_ms)
+                if image_path:
+                    result["image_path"] = image_path
+            if hwnd:
+                window_state = _build_window_state(hwnd)
+                if window_state:
+                    result["window_state"] = window_state
+            return result
 
     except Exception as e:
         return make_error(INPUT_FAILED, str(e))

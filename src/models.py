@@ -33,6 +33,14 @@ class WindowInfo(BaseModel):
     is_foreground: bool = False
 
 
+class WindowState(BaseModel):
+    """Lightweight window state metadata for tool responses."""
+    hwnd: int
+    title: str
+    is_foreground: bool
+    rect: Rect
+
+
 class MonitorInfo(BaseModel):
     """Information about a single monitor."""
     index: int

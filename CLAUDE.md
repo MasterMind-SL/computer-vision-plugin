@@ -1,7 +1,7 @@
 # Computer Vision Plugin for Claude Code
 
 ## Overview
-This is an MCP plugin that gives Claude Code full computer vision and input control across any Windows application. It provides 16 tools for screenshots, window management, mouse/keyboard input, OCR, natural language element finding, text extraction, UI accessibility, and multi-monitor support.
+This is an MCP plugin that gives Claude Code full computer vision and input control across any Windows application. It provides 17 tools for screenshots, window management, mouse/keyboard input, scrolling, OCR, natural language element finding, text extraction, UI accessibility, and multi-monitor support. All mutating tools return post-action screenshots for see-act-verify automation.
 
 ## Architecture
 - **MCP server**: FastMCP over stdio transport (never HTTP/SSE)
@@ -12,12 +12,14 @@ This is an MCP plugin that gives Claude Code full computer vision and input cont
 ## Coding Conventions
 - **Models**: Use Pydantic `BaseModel` for all data models (not dataclasses)
 - **Errors**: Use `make_error(code, message)` and `make_success(**payload)` from `src/errors.py` for non-image tools
-- **Security**: All mutating tools (F5-F9) must call security gate before execution:
-  1. `validate_hwnd_fresh(hwnd)` — check window still exists
-  2. `check_restricted(process_name)` — block restricted processes
-  3. `check_rate_limit()` — enforce rate limit
-  4. `guard_dry_run(tool, params)` — return early if dry-run
-  5. `log_action(tool, params, status)` — audit log
+- **Security**: All mutating tools must call security gate before execution:
+  1. `validate_hwnd_range(hwnd)` — check HWND in valid Win32 range
+  2. `validate_hwnd_fresh(hwnd)` — check window still exists
+  3. `check_restricted(process_name)` — block restricted processes
+  4. `check_rate_limit()` — enforce rate limit
+  5. `guard_dry_run(tool, params)` — return early if dry-run
+  6. `log_action(tool, params, status)` — audit log
+- **Shared helpers**: `src/utils/action_helpers.py` provides `_capture_post_action()`, `_build_window_state()`, `_get_hwnd_process_name()` — used by all mutating tools for post-action screenshots and window state metadata.
 - **Security (read-only tools)**: `cv_ocr`, `cv_find`, `cv_get_text`, `cv_read_ui` use subset: `validate_hwnd_range` + `validate_hwnd_fresh` + `check_restricted` + `log_action` (no rate limit or dry-run).
 - **Coordinates**: Screen-absolute physical pixels by default. DPI awareness set at startup.
 - **Screenshots**: Save images to temp files (`%TEMP%/cv_plugin_screenshots/`) and return `image_path` in the JSON response. Claude uses the `Read` tool on `image_path` to view images natively as a multimodal LLM. Files auto-clean after 5 minutes. Use `capture_window_raw()` / `capture_region_raw()` internally for OCR to avoid file round-trips.

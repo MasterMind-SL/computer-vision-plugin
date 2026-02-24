@@ -1,97 +1,127 @@
-# Implementation Backlog: CV Plugin v1.5.0 — Critical Regression Fixes
+# Implementation Backlog: CV Plugin v1.6.0 — Native Windows Control
 
 ## Foundation Tasks (Team Lead — before parallel work)
 
-### F-1. Fix GDI handle leak in `_capture_with_printwindow` [S]
-- In `src/utils/screenshot.py`, add `hdc_compat.DeleteDC()` to the finally block before `hdc_mem.DeleteDC()`
-- Initialize `hdc_compat = None` before try block
-- **MUST be done FIRST before any other capture changes** — promoting PrintWindow to primary without this fix leaks one GDI handle per screenshot call (10,000 handle limit crash)
+### F-1. Add `WindowState` model to `src/models.py` [S]
+- Add Pydantic model: `WindowState(hwnd: int, title: str, is_foreground: bool, rect: Rect)`
+- Uses existing `Rect` model
+- All downstream workstreams depend on this existing
 
-### F-2. No model/error/config changes needed for v1.5.0 [S]
-- All existing models (FindMatch, OcrWord, OcrRegion, ScreenshotResult, Rect, UiaElement) are sufficient
-- Existing error codes (FIND_NO_MATCH) already defined
-- No new config entries needed (cooldown constants are module-level)
+### F-2. Create `src/utils/action_helpers.py` with locked signatures [M]
+- **CRITICAL**: Exact signatures must be frozen before parallel work starts. All workstreams import from this file.
+- `_build_window_state(hwnd: int) -> dict | None` — calls `GetWindowText`, `GetForegroundWindow`, `GetWindowRect`. Returns `{"hwnd": int, "title": str, "is_foreground": bool, "rect": {"x": int, "y": int, "width": int, "height": int}}` or `None` on failure. NOTE: Do NOT duplicate `_build_window_info` from `win32_window.py` — either delegate or write minimal version with only the 3 required Win32 API calls.
+- `_capture_post_action(hwnd: int, delay_ms: int = 150, max_width: int = 1280) -> str | None` — sleeps `delay_ms/1000`, calls `capture_window(hwnd, max_width=max_width)`, returns `result.image_path` or `None` on failure (never raises).
+- `_get_hwnd_process_name(hwnd: int) -> str` — extracts PID via `GetWindowThreadProcessId`, delegates to `get_process_name_by_pid` from `security.py`. Returns `""` on failure.
+- Include unit-testable error handling (try/except returning None/"" on failure)
 
-**SYNC POINT SP-0:** All workstreams begin after F-1 completes (GDI leak fixed).
+### F-3. Modify `src/utils/win32_input.py` — scroll support + mouseData fix [M]
+- **CRITICAL**: This is an atomic task — mouseData type change + new constants + send_mouse_scroll MUST be done together by one agent.
+- Add constants: `MOUSEEVENTF_WHEEL = 0x0800`, `MOUSEEVENTF_HWHEEL = 0x1000`, `WHEEL_DELTA = 120`
+- Change `MOUSEINPUT.mouseData` field from `c_ulong` to `c_long` (signed, required for negative scroll values)
+- This change is backward-compatible: existing `send_mouse_click` and `send_mouse_drag` always pass mouseData=0, which is identical in signed and unsigned representation
+- Add function: `send_mouse_scroll(x: int, y: int, direction: str, amount: int = 3) -> bool` — builds INPUT struct with `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_WHEEL` (or `MOUSEEVENTF_HWHEEL` for left/right), sets `mouseData = amount * WHEEL_DELTA` (positive for up/left, negative for down/right)
+
+### F-4. Throttle screenshot cleanup in `src/utils/screenshot.py` [S]
+- Add module-level counter: `_cleanup_call_count: int = 0`
+- In `save_image()`: increment `_cleanup_call_count`, only call `_cleanup_old_screenshots()` when `_cleanup_call_count % 10 == 0`
+- Reduces filesystem overhead with post-action screenshots on every mutating tool
+
+**SYNC POINT SP-0:** All workstreams begin after F-1 through F-4 complete.
 
 ---
 
-## Workstream 1: Window Focus + Screenshot Capture (dev-alpha)
-**Features: F1 (Robust Focus) + F2 (PrintWindow-First Capture)**
-**Files:** `src/utils/win32_window.py`, `src/utils/screenshot.py`, `tests/unit/test_focus.py`, `tests/unit/test_capture_printwindow.py`
+## Workstream A: Atomic Keyboard + Scroll Tool (dev-alpha)
+**Features:** F1 (atomic keyboard with hwnd), F3 (cv_scroll), F2+F5 (screenshot + window_state on keyboard/scroll)
+**Files:** `src/tools/input_keyboard.py`, `src/tools/scroll.py`
 
 | # | Task | Size | Details |
 |---|------|------|---------|
-| 1.1 | Rewrite `focus_window()` with 4-strategy escalation | L | In `win32_window.py`. Strategy 1: Direct `SetForegroundWindow`. Strategy 2: `SendInput` ALT key (VK_MENU=0x12 down+up via ctypes, PAIRED keyup critical). Strategy 3: `AttachThreadInput` + `BringWindowToTop` + `SetForegroundWindow` (detach in finally). Strategy 4: SPI bypass (`SystemParametersInfoW(SPI_GETFOREGROUNDLOCKTIMEOUT)` save, set to 0, restore in finally, try/except for non-elevated). Pre-step: `ShowWindow(hwnd, SW_RESTORE)` if `IsIconic(hwnd)`. 6 retries, 50ms sleep. **Verification predicate**: `GetForegroundWindow() == hwnd` after each attempt. Return True only on verified success. |
-| 1.2 | Extract `_capture_window_impl(hwnd) -> Image` for DRY | M | In `screenshot.py`, factor shared logic from `capture_window()` and `capture_window_raw()` into shared implementation. Both callers use `_capture_window_impl`. |
-| 1.3 | Implement PrintWindow-first 3-tier fallback | L | In `_capture_window_impl`: (1) `PrintWindow(hwnd, hdc, PW_RENDERFULLCONTENT=0x02)` → validate not all-black via `img.getextrema()` (all channels min==max==0 → black). (2) `PrintWindow(hwnd, hdc, 0)` → validate. (3) MSS fallback. Add `flag` parameter to `_capture_with_printwindow(hwnd, w, h, flag=0x02)`. |
-| 1.4 | Handle minimized windows in capture | S | In `_capture_window_impl`: detect via `IsIconic(hwnd)`, use `ShowWindow(hwnd, SW_SHOWNOACTIVATE)` before PrintWindow (avoids focus theft), re-minimize after capture only if foreground unchanged. |
-| 1.5 | Write `tests/unit/test_focus.py` (~15 tests) | M | Test: each strategy success/failure, escalation order, retry count, verification predicate, SPI save/restore in finally, paired ALT keyup even on exception, minimized restore, all-fail returns False. Mock `ctypes.windll.user32`, `win32gui`, `win32process`. |
-| 1.6 | Write `tests/unit/test_capture_printwindow.py` (~12 tests) | M | Test: PW_RENDERFULLCONTENT success, all-black triggers fallback to PW(0), all-black triggers MSS, GDI cleanup (verify DeleteDC calls), minimized handling with SW_SHOWNOACTIVATE, `_capture_window_impl` shared path, getextrema validation (normal image passes, black image fails, mostly-black-with-content passes). |
+| A.1 | Modify `cv_type_text` and `cv_send_keys` with hwnd support | L | In `input_keyboard.py`. Add params: `hwnd: int \| None = None`, `screenshot: bool = True`, `screenshot_delay_ms: int = 150`. **When hwnd provided**: (1) `validate_hwnd_range(hwnd)`, (2) `validate_hwnd_fresh(hwnd)`, (3) `_get_hwnd_process_name(hwnd)` — if empty string, return `make_error(ACCESS_DENIED, "Cannot determine process")`, (4) `check_restricted(process_name)`, (5) `guard_dry_run(...)`, (6) `log_action(...)`. Then atomic retry loop (max 3): `focus_window(hwnd)` → verify `GetForegroundWindow() == hwnd` → `check_rate_limit()` (inside loop per security audit) → inject (`type_unicode_string` or `send_key_combo`) → break on success. On exhausted retries: `make_error(INPUT_FAILED, "Could not acquire focus after 3 attempts")`. After success: `_capture_post_action(hwnd, screenshot_delay_ms)` if screenshot=True, `_build_window_state(hwnd)`, merge into `make_success()`. **When hwnd=None**: preserve exact v1.5.0 behavior (existing security: `check_rate_limit` + `guard_dry_run` + `log_action`, no screenshot, no window_state). |
+| A.2 | Create `cv_scroll` tool | L | New file `src/tools/scroll.py`. Tool: `cv_scroll(hwnd: int, direction: str = "down", amount: int = 3, x: int \| None = None, y: int \| None = None, screenshot: bool = True, screenshot_delay_ms: int = 150)`. (1) Validate direction in `("up", "down", "left", "right")` — return `make_error(INVALID_PARAMETER)` otherwise. (2) Clamp amount to `[1, 20]`. (3) Full security gate: `validate_hwnd_range` → `validate_hwnd_fresh` → `_get_hwnd_process_name` (empty = ACCESS_DENIED) → `check_restricted` → `check_rate_limit` → `guard_dry_run` → `log_action`. (4) `focus_window(hwnd)`. (5) If x/y provided: `validate_coordinates(x, y, hwnd)`, convert to screen absolute. If not provided: use window center from `GetWindowRect`. (6) `normalize_for_sendinput(screen_x, screen_y)`. (7) `send_mouse_scroll(norm_x, norm_y, direction, amount)`. (8) `_capture_post_action` + `_build_window_state`. (9) Return `make_success(action="scroll", direction=direction, amount=amount, image_path=..., window_state=...)`. Import `mcp` from `src.server`. |
 
-**SYNC POINT SP-1:** After task 1.3 complete, notify Workstream 3 that `capture_window()` now uses PrintWindow-first (F4 vision fallback benefits from correct screenshots).
+**Dependencies:** Both tasks depend on F-2 (action_helpers.py) and A.2 depends on F-3 (win32_input.py scroll support).
 
 ---
 
-## Workstream 2: Chrome/Electron Accessibility Activation (dev-beta)
-**Feature: F3 (Chrome UIA Activation)**
-**Files:** `src/utils/uia.py`, `tests/unit/test_chromium_accessibility.py`
+## Workstream B: Mouse + Find Enhancements + Polish (dev-beta)
+**Features:** F2 (post-action screenshot on mouse), F4 (vision-enhanced cv_find), F5 (window_state verification), F6 (version bump)
+**Files:** `src/tools/input_mouse.py`, `src/tools/find.py`, `.claude-plugin/plugin.json`, `pyproject.toml`
 
 | # | Task | Size | Details |
 |---|------|------|---------|
-| 2.1 | Define Chromium detection constants | S | Module-level in `uia.py`: `_CHROMIUM_PROCESSES = frozenset({'chrome', 'msedge', 'electron', 'code', 'slack', 'discord', 'teams', 'spotify', 'notion', 'figma', 'postman', 'brave', 'vivaldi', 'opera'})`, `WM_GETOBJECT = 0x003D`, `OBJID_CLIENT = 0xFFFFFFFC`, `SMTO_ABORTIFHUNG = 0x0002`. |
-| 2.2 | Implement `_ensure_chromium_accessibility(hwnd)` | L | New function in `uia.py`. (1) Check cache `_activated_hwnds: set[int]` — skip if already activated. (2) Get process name via `_get_process_name` imported from `win32_window.py`. (3) Get class via `win32gui.GetClassName(hwnd)`. (4) If process in set OR class == `"Chrome_WidgetWin_1"`: enumerate children via `EnumChildWindows`. (5) For each child with class EXACTLY `"Chrome_RenderWidgetHostHWND"`: call `ctypes.windll.user32.SendMessageTimeoutW(child_hwnd, WM_GETOBJECT, 0, OBJID_CLIENT, SMTO_ABORTIFHUNG, 2000, None)`. (6) Sleep 200ms after activation. (7) Add hwnd to cache set. |
-| 2.3 | Integrate into `get_ui_tree()` | S | Call `_ensure_chromium_accessibility(hwnd)` at top of `get_ui_tree()`, after `_safe_init_uia()`, before `ElementFromHandle(hwnd)`. Wrap in try/except — activation failure should not block UIA tree walk. |
-| 2.4 | Write `tests/unit/test_chromium_accessibility.py` (~10 tests) | M | Test: detection by process name (chrome), detection by class name (Chrome_WidgetWin_1), non-Chromium skipped, EnumChildWindows finds Chrome_RenderWidgetHostHWND, SendMessageTimeoutW called with correct params (WM_GETOBJECT, OBJID_CLIENT, SMTO_ABORTIFHUNG, 2000ms), caching prevents re-trigger on same hwnd, activation failure doesn't break get_ui_tree, exact class name match (not substring). Mock `ctypes.windll.user32`, `win32gui`, `win32process`. |
+| B.1 | Modify `cv_mouse_click` with screenshot + window_state | M | In `input_mouse.py`. Add params: `screenshot: bool = True`, `screenshot_delay_ms: int = 150`. After successful click/drag: if `screenshot=True` and hwnd was provided, call `_capture_post_action(hwnd, screenshot_delay_ms)` and add `image_path` to response dict. Call `_build_window_state(hwnd)` and add `window_state` to response. Backward compatible: `screenshot=False` restores v1.5.0 response shape. No changes to existing focus/security logic. |
+| B.2 | Modify `cv_find` with vision enhancement | M | In `find.py`. **Four explicit additions**: (1) On SUCCESS path: always call `capture_window(hwnd, max_width=1280)` — NO cooldown for success (remove/bypass existing cooldown check on success branch). (2) Add `image_path` from capture result to success response dict. (3) Compute `image_scale = saved_image_width / physical_window_width` (from `GetWindowRect`) and add to response. (4) Add `window_origin: {"x": rect[0], "y": rect[1]}` to response. Keep existing no-match screenshot path with its 5s cooldown UNCHANGED. Add `_build_window_state(hwnd)` to success response. Update tool docstring with coordinate mapping formula: `screen_x = window_origin.x + (image_x / image_scale)`. |
+| B.3 | F5 verification sweep — window_state in all tools | S | Audit all mutating tools after A.1, A.2, B.1, B.2 are complete. Verify `window_state` is present in every response where hwnd is available. Check both success and error paths. Fix any gaps. |
+| B.4 | Version bump to 1.6.0 | S | `pyproject.toml`: version = "1.6.0". `.claude-plugin/plugin.json`: version = "1.6.0". |
 
-**SYNC POINT SP-2:** After task 2.3 complete, all UIA consumers (`cv_find`, `cv_read_ui`, `cv_get_text`) automatically benefit from Chrome accessibility.
+**Dependencies:** B.1 and B.2 depend on F-2 (action_helpers.py) and F-4 (screenshot throttle). B.3 depends on all implementation tasks. B.4 is independent.
 
 ---
 
-## Workstream 3: Vision Fallback + Version Bump (dev-gamma)
-**Features: F4 (cv_find Vision Fallback) + F5 (Version Bump)**
-**Files:** `src/tools/find.py`, `tests/unit/test_find_fallback.py`, `.claude-plugin/plugin.json`, `pyproject.toml`
+## Workstream C: Tests (dev-gamma)
+**Features:** 100% test coverage on all new code
+**Files:** `tests/unit/test_post_action.py`, `tests/unit/test_keyboard_hwnd.py`, `tests/unit/test_scroll.py`, `tests/unit/test_find_vision.py`
 
 | # | Task | Size | Details |
 |---|------|------|---------|
-| 3.1 | Add per-HWND screenshot cooldown state | S | In `find.py`, add `_screenshot_cooldowns: dict[int, float] = {}` and `_SCREENSHOT_COOLDOWN = 5.0` at module level. Helper `_can_screenshot(hwnd) -> bool`: returns True if hwnd not in dict or `time.monotonic() - _screenshot_cooldowns[hwnd] >= _SCREENSHOT_COOLDOWN`. |
-| 3.2 | Implement vision fallback on FIND_NO_MATCH | M | In `cv_find()`, in the `if not matches:` block: check `_can_screenshot(hwnd)`, if yes: try `capture_window(hwnd, max_width=1280)`, update cooldown, include `image_path` in error response. Error becomes: `{**make_error(FIND_NO_MATCH, "No elements matching '...' found. Use Read tool on image_path to visually inspect."), "image_path": result.image_path}`. Wrap in try/except — capture failure returns normal error without image_path. |
-| 3.3 | Write `tests/unit/test_find_fallback.py` (~8 tests) | M | Test: no-match returns image_path, cooldown prevents second screenshot within 5s, cooldown allows after 5s, different HWNDs independent cooldowns, capture failure returns FIND_NO_MATCH without image_path, successful matches do NOT include image_path, cooldown uses time.monotonic. Mock `capture_window`, `time.monotonic`. |
-| 3.4 | Version bump to 1.5.0 | S | `.claude-plugin/plugin.json`: `"version": "1.4.0"` → `"1.5.0"`. `pyproject.toml`: `version = "1.4.0"` → `"1.5.0"`. |
+| C.1 | Create `tests/unit/test_post_action.py` (~10 tests) | M | Tests for shared helpers: `_capture_post_action` returns image_path on success, returns None on capture failure, honors delay_ms (mock time.sleep), respects max_width. `_build_window_state` returns correct 4-key dict, returns None for invalid hwnd. `_get_hwnd_process_name` returns process name, returns "" on failure. Screenshot cleanup counter increments and triggers every 10th call. |
+| C.2 | Create `tests/unit/test_keyboard_hwnd.py` (~15 tests) | L | Tests: hwnd=None preserves exact v1.5.0 behavior (no security gate additions). hwnd provided triggers full security gate (validate_hwnd_range, validate_hwnd_fresh, check_restricted, guard_dry_run, log_action all called). Atomic focus retry: success on first try, success on retry #2, exhausted 3 retries returns INPUT_FAILED. check_rate_limit called inside retry loop (once per attempt). Empty process name returns ACCESS_DENIED. screenshot=True includes image_path in response. screenshot=False excludes image_path. window_state included when hwnd provided. Restricted process blocked. cv_send_keys with hwnd follows same pattern. dry_run returns planned action. |
+| C.3 | Create `tests/unit/test_scroll.py` (~15 tests) | L | Tests: valid directions accepted (up/down/left/right). Invalid direction returns INVALID_PARAMETER. Amount clamping: 0→1, 25→20, 3→3. Full security gate called in order. `test_scroll_down_positive_mousedata` — mouseData > 0 for "down". `test_scroll_up_negative_mousedata` — mouseData < 0 for "up" (CRITICAL: validates c_long change). `test_scroll_left_right_uses_hwheel` — MOUSEEVENTF_HWHEEL flag used. Default coords = window center when x/y omitted. Custom x/y converted to screen absolute. screenshot after scroll included. screenshot=False suppresses capture. window_state in response. Empty process name returns ACCESS_DENIED. hwnd required (no default). |
+| C.4 | Create `tests/unit/test_find_vision.py` (~10 tests) | M | Tests: success response includes image_path (always, no cooldown). Success response includes image_scale (correct ratio). Success response includes window_origin (matches GetWindowRect). window_state in success response. No-match still has vision fallback with 5s cooldown (existing behavior preserved). image_scale calculation: `saved_width / physical_width`. Coordinate mapping metadata correct. max_results still respected. method_used still in response. |
+| C.5 | Regression verification | S | Run `uv run pytest tests/unit/ -v`. All 272 existing tests + ~50 new tests must pass. Verify server starts with 17 tools (16 existing + cv_scroll). Zero failures. |
 
-**NOTE:** Task 3.2 works with existing `capture_window()` but benefits from Workstream 1's PrintWindow-first fix. Not blocked — can start immediately.
+**Dependencies:** C.1 can start immediately after F-2 (tests shared helpers). C.2 depends on A.1. C.3 depends on A.2. C.4 depends on B.2. C.5 depends on all.
 
 ---
 
-## Dependency Graph
+## Cross-Workstream Dependency Graph
 
 ```
-F-1 (GDI fix) ────────────────────────────────────────> All workstreams start
-                                                         │
-Workstream 1 (F1+F2): 1.1→1.2→1.3→1.4→1.5→1.6          │ parallel
-Workstream 2 (F3):    2.1→2.2→2.3→2.4                   │ parallel
-Workstream 3 (F4+F5): 3.1→3.2→3.3→3.4                   │ parallel
-                                                         │
-                       ──────── SP-1 (capture fixed) ────┤── improves F4 screenshots
-                       ──────── SP-2 (Chrome a11y) ──────┤── improves cv_find UIA
-                                                         │
-                       ──────── All complete ─────────────> Integration testing
+Foundation (team-lead):
+  F-1 (models.py)  ──┐
+  F-2 (action_helpers) ──┤── SP-0: all workstreams start
+  F-3 (win32_input)  ──┤
+  F-4 (screenshot)   ──┘
+                        │
+         ┌──────────────┼──────────────┐
+         ▼              ▼              ▼
+  WS-A (keyboard+scroll) WS-B (mouse+find)  WS-C (tests)
+  dev-alpha           dev-beta          dev-gamma
+  A.1: keyboard hwnd  B.1: mouse screenshot C.1: test_post_action
+  A.2: cv_scroll       B.2: cv_find vision   C.2: test_keyboard (after A.1)
+                       B.3: F5 sweep (after A+B) C.3: test_scroll (after A.2)
+                       B.4: version bump      C.4: test_find (after B.2)
+                                              C.5: regression (last)
 ```
+
+## Integration Checkpoints
+
+**Checkpoint 1** (after A.1 + A.2 + B.1 + B.2 complete):
+- Verify all 4 tool files import from `action_helpers.py` correctly
+- Verify `scroll.py` auto-discovered by FastMCP (imports `mcp` from `src.server`)
+- Verify no circular imports
+- dev-beta runs B.3 (F5 verification sweep)
+
+**Checkpoint 2** (after all tests written):
+- Run full test suite: `uv run pytest tests/unit/ -v`
+- Verify 272 existing + ~50 new = ~322 tests passing
+- Verify server reports 17 tools
 
 ---
 
 ## Post-Integration Tasks (Team Lead)
 
-### P-1. Run full test suite [M]
-- `uv run pytest tests/unit/ -v` — all 218 existing + ~45 new tests must pass
-- Verify server starts: `python -c "from src.server import mcp; print(len(mcp._tool_manager._tools), 'tools')"`
-- Should still be 16 tools (no new tools added in v1.5.0)
+### P-1. Full test suite run [M]
+- `uv run pytest tests/unit/ -v` — all tests must pass
+- Verify: `python -c "from src.server import mcp; print(len(mcp._tool_manager._tools), 'tools')"` → 17 tools
 
-### P-2. Verify behavioral fixes [M]
-- cv_focus_window: returns `focused: False` on verified failure (not false success)
-- cv_screenshot_window: returns correct content for occluded windows
-- cv_find: returns UIA elements for Chrome windows
-- cv_find: returns image_path on FIND_NO_MATCH
+### P-2. Behavioral verification [M]
+- cv_type_text with hwnd: returns image_path + window_state
+- cv_send_keys with hwnd: returns image_path + window_state
+- cv_mouse_click: returns image_path + window_state
+- cv_scroll: returns image_path + window_state
+- cv_find success: returns image_path + image_scale + window_origin
+- Existing cv_mouse_click without screenshot param: still works (backward compat)
 
 ---
 
@@ -99,24 +129,26 @@ Workstream 3 (F4+F5): 3.1→3.2→3.3→3.4                   │ parallel
 
 | Size | Count | Tasks |
 |------|-------|-------|
-| Small (S) | 5 | F-1, F-2, 2.1, 3.1, 3.4 |
-| Medium (M) | 7 | 1.2, 1.5, 1.6, 2.4, 3.2, 3.3, P-1 |
-| Large (L) | 3 | 1.1, 1.3, 2.2 |
+| Small (S) | 4 | F-1, F-4, B.3, B.4, C.5 |
+| Medium (M) | 7 | F-2, F-3, B.1, B.2, C.1, C.4 |
+| Large (L) | 4 | A.1, A.2, C.2, C.3 |
 | **Total** | **15 tasks** + 2 post-integration | |
 
 ## Feature Coverage Verification
 
 | PRD Feature | Workstream | Task(s) |
 |-------------|-----------|---------|
-| F1: Robust Window Focus | WS1 | 1.1 (4-strategy rewrite) |
-| F2: PrintWindow-First Capture | WS1 | F-1 (GDI fix), 1.2 (_capture_window_impl), 1.3 (3-tier fallback), 1.4 (minimized handling) |
-| F3: Chrome/Electron Accessibility | WS2 | 2.1 (constants), 2.2 (activation function), 2.3 (integration) |
-| F4: Vision Fallback in cv_find | WS3 | 3.1 (cooldown), 3.2 (screenshot on no-match) |
-| F5: Version Bump 1.5.0 | WS3 | 3.4 (plugin.json + pyproject.toml) |
-| Security: SPI save/restore | WS1 | 1.1 (strategy 4 in finally block) |
-| Security: SendInput safety | WS1 | 1.1 (paired keyup, bound to 1 call) |
-| Security: GDI leak fix | Foundation | F-1 (hdc_compat cleanup) |
-| Security: SendMessageTimeoutW | WS2 | 2.2 (SMTO_ABORTIFHUNG, 2s timeout) |
-| Security: Screenshot cooldown | WS3 | 3.1 (per-HWND 5s cooldown) |
+| F1: Atomic Keyboard with hwnd | WS-A | A.1 (cv_type_text + cv_send_keys) |
+| F2: Post-Action Screenshot | WS-A + WS-B | A.1 (keyboard), A.2 (scroll), B.1 (mouse) |
+| F3: cv_scroll | Foundation + WS-A | F-3 (win32_input), A.2 (scroll tool) |
+| F4: Vision-Enhanced cv_find | WS-B | B.2 (screenshot on success + metadata) |
+| F5: Window State in Every Response | All | A.1, A.2, B.1, B.2 (add window_state), B.3 (verification sweep) |
+| F6: Version Bump 1.6.0 | WS-B | B.4 (plugin.json + pyproject.toml) |
+| Security: Full gate on keyboard+scroll | WS-A | A.1, A.2 |
+| Security: Empty process = ACCESS_DENIED | WS-A | A.1, A.2 |
+| Security: Rate limit in retry loop | WS-A | A.1 |
+| Security: Scroll amount clamped [1,20] | WS-A | A.2 |
+| Testing: ~50 new tests | WS-C | C.1, C.2, C.3, C.4 |
+| Testing: Zero regressions on 272 | WS-C | C.5 |
 
-**All 5 PRD features + all security requirements assigned. Zero deferrals.**
+**All 6 PRD features + all security requirements + all testing requirements assigned. Zero deferrals.**

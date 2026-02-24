@@ -265,6 +265,10 @@ def cv_find(
     Searches using UIA (UI Automation) first for native app elements,
     then falls back to OCR for visual text matching.
 
+    When image_path is returned, use image_scale and window_origin to map visual
+    coordinates: screen_x = window_origin.x + (image_x / image_scale),
+    screen_y = window_origin.y + (image_y / image_scale)
+
     Args:
         query: Natural language description of what to find (e.g., "search bar", "submit button").
         hwnd: Window handle to search in.
@@ -346,12 +350,46 @@ def cv_find(
                     f"No elements matching '{query}' found. "
                     "Use Read tool on image_path to visually inspect the window."
                 )
+                # Add scale metadata for coordinate mapping
+                rect_for_scale = win32gui.GetWindowRect(hwnd)
+                pw = rect_for_scale[2] - rect_for_scale[0]
+                if pw > 0:
+                    error["image_scale"] = min(pw, 1280) / pw
+                    error["window_origin"] = {"x": rect_for_scale[0], "y": rect_for_scale[1]}
             except Exception:
                 pass  # Capture failure: return normal error without image_path
         return error
 
-    return make_success(
+    result = make_success(
         matches=[m.model_dump() for m in matches[:max_results]],
         match_count=len(matches),
         method_used=method_used,
     )
+
+    # Always capture screenshot on success (no cooldown for success path)
+    try:
+        from src.utils.screenshot import capture_window
+
+        capture_result = capture_window(hwnd, max_width=1280)
+        result["image_path"] = capture_result.image_path
+
+        # Compute image_scale: ratio of saved image width to physical window width
+        rect = win32gui.GetWindowRect(hwnd)
+        physical_width = rect[2] - rect[0]
+        if physical_width > 0:
+            saved_width = min(physical_width, 1280)
+            result["image_scale"] = saved_width / physical_width
+
+        # Window origin for coordinate mapping
+        result["window_origin"] = {"x": rect[0], "y": rect[1]}
+    except Exception:
+        pass  # Screenshot failure doesn't block the success response
+
+    # Add window state metadata
+    from src.utils.action_helpers import _build_window_state
+
+    window_state = _build_window_state(hwnd)
+    if window_state:
+        result["window_state"] = window_state
+
+    return result

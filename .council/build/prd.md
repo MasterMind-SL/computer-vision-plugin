@@ -1,134 +1,163 @@
-# PRD: Computer Vision Plugin v1.5.0 — Critical Regression Fixes
+# PRD: Native Windows Control v1.6.0
 
-## 1. Problem Statement
+## Problem Statement
 
-The Computer Vision plugin v1.4.0 has three critical regressions discovered during live testing that make it unreliable for real-world desktop automation:
+The CV Plugin v1.5.0 can see the screen and inject input, but cannot reliably **control** applications. Three structural deficiencies prevent human-like automation:
 
-1. **cv_focus_window silently fails** — Uses only `AttachThreadInput` + `SetForegroundWindow`, which Windows blocks from background processes. The MCP server runs as a background process, so this fails in the most common scenario. The function returns success even when the window never reaches the foreground, causing downstream click/type operations to hit the wrong window.
+1. **Focus loss between tool calls.** `cv_type_text` and `cv_send_keys` inject keystrokes into whatever window is foreground — which is the terminal, not the target app. The MCP host terminal reclaims focus between every tool call. `cv_mouse_click` already has `hwnd` for auto-focus; keyboard tools do not.
 
-2. **cv_screenshot_window captures wrong pixels** — Uses MSS (screen pixel grab) as primary capture method. MSS copies whatever is visually on top at the window's screen coordinates. If another window overlaps, the screenshot shows the wrong application. The `PrintWindow` fallback exists but is only tried after MSS fails, not when MSS returns incorrect content. **Additionally, `capture_window_raw()` has the identical MSS-first ordering** and is used internally by `cv_find` (OCR path), `cv_ocr`, and `cv_get_text` — meaning three downstream tools also capture wrong content silently.
+2. **Blind element location.** `cv_find` relies on UIA trees (sparse for Chrome/Electron) and OCR (requires en-US language pack). Claude is a multimodal LLM that can SEE screenshots, yet the plugin doesn't leverage this as the primary element finding strategy.
 
-3. **cv_find returns zero results for Chrome/Electron** — Chrome does not expose its UIA accessibility tree unless explicitly activated by an assistive technology signal. Since Chrome/Electron powers VS Code, Slack, Discord, Teams, Spotify, and hundreds of modern apps, cv_find is broken for the majority of Windows applications. The fix is well-known: send `WM_GETOBJECT` to `Chrome_RenderWidgetHostHWND` child windows.
+3. **No state verification after actions.** Every mutating tool returns minimal JSON (`{"success": true}`) with zero visual confirmation. Claude cannot confirm a click landed, text appeared, or a page loaded. Without see-act-verify, automation requires blind trust.
 
-**Additionally**, when cv_find fails to match elements, it returns an error with no visual context. Since Claude is a multimodal LLM that can SEE screenshots natively, the plugin should return a screenshot on failure so Claude can use its vision capabilities.
+## Target Users
 
-**Also**, the existing `_capture_with_printwindow()` function has a GDI handle leak (`hdc_compat` not cleaned up in finally block). Promoting PrintWindow to primary capture will leak on every screenshot call, eventually exhausting the Windows GDI handle pool (10,000 limit).
+Claude Code users automating ANY Windows desktop application — browsers, IDEs, native Win32 apps, Electron apps, legacy enterprise software — via the MCP plugin. The plugin should enable a human-like see-act-verify loop.
 
-## 2. Target Users
-
-- Claude Code users automating desktop workflows across arbitrary Windows applications
-- Developers using Claude Code to interact with IDEs, browsers, design tools, and enterprise software
-- QA/testing scenarios where Claude Code drives application UI
-
-## 3. Success Metrics
+## Success Metrics
 
 | Metric | Target |
 |--------|--------|
-| `cv_focus_window` foreground success rate | ≥95% from background process context |
-| `cv_screenshot_window` correct content when occluded | 100% for non-minimized windows |
-| `cv_find` UIA results for Chrome/Electron apps | >90% of DOM elements exposed |
-| `cv_find` vision fallback on no-match | Returns `image_path` 100% of the time |
-| Existing unit tests passing | 218/218 (100%) |
-| GDI handle leaks | Zero (verified cleanup in finally blocks) |
-| New external dependencies | Zero |
+| Type into Chrome address bar | ONE tool call (atomic focus+type+screenshot) |
+| Scroll any window | ONE tool call (new cv_scroll tool) |
+| Post-action verification | Every mutating tool returns screenshot |
+| Element finding on web pages | Claude's vision as primary fallback |
+| Existing tests | Zero regressions on 272 tests |
+| New test coverage | 100% on new code |
 
-## 4. Core Features (ALL MANDATORY)
+## Core Features (ALL MANDATORY)
 
-### F1: Robust Window Focus (`cv_focus_window` rewrite)
+### F1. Atomic Keyboard Operations with hwnd
 
-Implement AutoHotkey-grade foreground activation with multi-strategy escalation:
+Add optional `hwnd: int | None` parameter to `cv_type_text` and `cv_send_keys`.
 
-**Strategy order:**
-1. Direct `SetForegroundWindow` (works when caller already owns foreground)
-2. `SendInput` ALT key injection (`VK_MENU` down+up via `ctypes.windll.user32.SendInput`) to satisfy Windows' "received last input event" condition, then `SetForegroundWindow`
-3. `AttachThreadInput` to cross-thread input queue attachment + `BringWindowToTop` + `SetForegroundWindow`
-4. `SPI_SETFOREGROUNDLOCKTIMEOUT` bypass via `SystemParametersInfoW` — temporarily sets foreground lock timeout to 0, calls `SetForegroundWindow`, restores original value. **Wrapped in try/except**: if non-elevated process lacks privileges, log debug message and skip.
+When hwnd is provided:
+1. Call `focus_window(hwnd)` to bring window to foreground
+2. Verify `GetForegroundWindow() == hwnd` before injecting input
+3. Inject keystrokes immediately (no yield between focus and input)
+4. Verify focus was maintained after input
+5. If focus lost between steps 1-3, retry entire atomic operation (max 3 retries)
+6. Capture post-action screenshot of target window
+7. Return screenshot path + action result
 
-**Retry behavior:**
-- Up to 6 attempts with escalating strategies, 50ms sleep between attempts
-- **Verification predicate after each attempt**: `GetForegroundWindow() == hwnd`. Return success immediately upon verification. Only retry if verification fails.
-- Restore minimized windows via `SW_RESTORE` before first attempt
-- `BringWindowToTop` as supplementary call on each attempt
-- Return `focused: True` ONLY when verification confirms foreground ownership
-- On final failure, return `focused: False` with descriptive error
+When hwnd is None: preserve current v1.5.0 behavior (backward compatible).
 
-**Implementation scope:** Rewrite `focus_window()` in `src/utils/win32_window.py`
+**Security**: When hwnd is provided, apply full 5-step security gate: `validate_hwnd_range` → `validate_hwnd_fresh` → `check_restricted(process_name)` → `check_rate_limit` → `guard_dry_run` → `log_action`. Mirror pattern from `cv_mouse_click`.
 
-### F2: Correct Window Screenshots (PrintWindow-first capture)
+### F2. Post-Action Screenshot on All Mutating Tools
 
-Reverse the capture order in BOTH `capture_window()` AND `capture_window_raw()`:
+Every mutating tool (`cv_type_text`, `cv_send_keys`, `cv_mouse_click`, `cv_scroll`) returns an `image_path` field containing a screenshot of the target window AFTER the action completes.
 
-**3-tier fallback chain:**
-1. **Primary**: `PrintWindow(hwnd, hdc, PW_RENDERFULLCONTENT)` (0x02) — captures DWM-composed content even when occluded, works for Chrome/Electron/DirectX
-2. **Secondary**: `PrintWindow(hwnd, hdc, 0)` — standard PrintWindow without DWM compositing, for legacy apps where PW_RENDERFULLCONTENT returns failure
-3. **Tertiary**: MSS screen pixel grab — fast path fallback for cases where both PrintWindow calls fail
+Parameters:
+- `screenshot: bool = True` — opt-out flag to disable screenshot capture
+- `screenshot_delay_ms: int = 150` — rendering settle delay before capture (default 150ms, caller can increase to 500-1000ms for web pages)
 
-**Validation:** After each PrintWindow call, check if result is not all-black by sampling a center 10x10 pixel region (mean value > 5). If all-black, proceed to next tier.
+Implementation: Create shared helper `_capture_post_action(hwnd: int | None, delay_ms: int) -> str | None` that handles the sleep + capture + save. Returns image path or None. All mutating tools call this after their action.
 
-**Minimized window handling:** Restore temporarily before PrintWindow (PrintWindow returns blank for minimized windows), capture, then re-minimize.
+**Critical**: Tools must still return `dict` (via `make_success()`). The `image_path` field is added to the dict, NOT returned as ImageContent blocks. This preserves all internal consumers (cv_find, OCR tools). Claude reads the screenshot via the Read tool on the path.
 
-**GDI handle leak fix:** Track `hdc_compat` in the finally block of `_capture_with_printwindow()` and call `hdc_compat.DeleteDC()` before `hdc_mem.DeleteDC()`.
+### F3. cv_scroll — Dedicated Scroll Tool
 
-**Implementation scope:** Modify `capture_window()`, `capture_window_raw()`, and `_capture_with_printwindow()` in `src/utils/screenshot.py`
+New tool: `cv_scroll(hwnd, direction, amount, x, y, screenshot, screenshot_delay_ms)`
 
-### F3: Chrome/Electron Accessibility Activation
+Parameters:
+- `hwnd: int` — target window handle (required)
+- `direction: str` — "up", "down", "left", "right"
+- `amount: int = 3` — number of scroll notches (each = WHEEL_DELTA = 120)
+- `x: int | None = None` — optional X position for scroll target (window-relative)
+- `y: int | None = None` — optional Y position for scroll target (window-relative)
+- `screenshot: bool = True` — capture after scroll
+- `screenshot_delay_ms: int = 150` — settle delay
 
-Automatically activate Chrome/Electron accessibility trees before any UIA tree walk:
+Implementation:
+- Focus window via `focus_window(hwnd)`
+- Move cursor to (x, y) within window, or window center if not specified
+- Use `SendInput` with `MOUSEEVENTF_WHEEL` (vertical) or `MOUSEEVENTF_HWHEEL` (horizontal)
+- Multiply `amount` by `WHEEL_DELTA` (120) for scroll distance
+- Apply full mutating-tool security gate
+- Return post-action screenshot
 
-**Detection:** Check if the target window's process name matches known Chromium-based apps: `{'chrome', 'msedge', 'electron', 'code', 'slack', 'discord', 'teams', 'spotify', 'notion', 'figma', 'postman'}`. Also detect by window class `Chrome_WidgetWin_1` as a catch-all.
+File: `src/tools/scroll.py`
 
-**Activation:**
-1. Use `win32gui.EnumChildWindows(hwnd, callback, results)` to find ALL child windows with class `Chrome_RenderWidgetHostHWND`
-2. For each found child: `win32gui.SendMessage(child_hwnd, WM_GETOBJECT, 0, OBJID_CLIENT)` where `WM_GETOBJECT = 0x003D` and `OBJID_CLIENT = 0xFFFFFFFC`
-3. Sleep 200ms after activation to let Chrome populate the accessibility tree
+### F4. Vision-Enhanced cv_find
 
-**Caching:** Module-level `set()` of activated top-level HWNDs. Skip activation for already-activated windows. Thread-safe since MCP tools run sequentially.
+Enhance `cv_find` to leverage Claude's multimodal vision:
 
-**Integration point:** Insert activation check at the top of `get_ui_tree()` in `src/utils/uia.py`, so ALL UIA consumers (`cv_find`, `cv_read_ui`, `cv_get_text`) benefit automatically.
+1. **Always include screenshot on success**: When matches are found, include `image_path` in the success response so Claude can visually verify the match makes sense.
+2. **Always include screenshot on failure**: Already implemented in v1.5.0 (with 5s cooldown). Keep failure-path cooldown to prevent spam, but remove cooldown for success-path screenshots.
+3. **Coordinate mapping in tool description**: Document the formula for mapping downscaled image coordinates to screen coordinates: `screen_x = rect.x + (image_x / scale_factor)`, `screen_y = rect.y + (image_y / scale_factor)` where `scale_factor = image_width / physical_width`.
+4. **Include scale metadata**: Return `image_scale` and `window_origin` in responses so Claude can compute click targets from visual inspection.
 
-**Implementation scope:** New helper function `_ensure_chromium_accessibility(hwnd)` in `src/utils/uia.py`, called from `get_ui_tree()`
+### F5. Window State in Every Response
 
-### F4: Vision Fallback in `cv_find`
+Every tool that accepts `hwnd` includes `window_state` metadata in its response:
 
-When `cv_find` fails to match elements (both UIA and OCR return empty in auto mode):
-- Capture a screenshot of the window using `capture_window(hwnd)`
-- Include `image_path` in the FIND_NO_MATCH error response
-- Claude will use its `Read` tool on the image_path to visually inspect the window and retry with a better query or use coordinates from what it sees
+```json
+{
+  "window_state": {
+    "hwnd": 198902,
+    "title": "Google - Google Chrome",
+    "is_foreground": true,
+    "rect": {"x": 0, "y": 0, "width": 1920, "height": 1040}
+  }
+}
+```
 
-**Scope:** Only `cv_find` on FIND_NO_MATCH. Other tools (`cv_ocr`, `cv_get_text`) already operate on visual content and don't need this. The screenshot on failure costs one PrintWindow call, which is acceptable for an already-failed search.
+Implementation: Shared helper `_build_window_state(hwnd: int) -> dict` that calls `GetWindowText`, `GetForegroundWindow`, `GetWindowRect`. Called at the end of each tool after the action completes. Lightweight — no screenshot, just metadata.
 
-**Implementation scope:** Modify `cv_find` in `src/tools/find.py`
+### F6. Version Bump to 1.6.0
 
-### F5: Version Bump to 1.5.0
+Update version in `pyproject.toml` and `.claude-plugin/plugin.json`.
 
-Bump version in ALL version-bearing files:
-- `.claude-plugin/plugin.json`
-- `pyproject.toml`
+## User Stories
 
-## 5. User Stories
+1. "As Claude, I need to type a URL into Chrome's address bar in a single tool call, so I can navigate without losing focus to the terminal." → F1
+2. "As Claude, I need to see what happened after I clicked a button, so I can verify the action succeeded and decide what to do next." → F2
+3. "As Claude, I need to scroll down a web page to find content below the fold, so I can read or interact with the full page." → F3
+4. "As Claude, I need to find the 'Submit' button on a complex web form by looking at a screenshot, because UIA doesn't expose it and OCR might miss styled text." → F4
+5. "As Claude, I need to know which window received my action and whether it's still focused, so I can recover from unexpected state changes." → F5
 
-- **US1**: As a Claude Code user, when I call `cv_focus_window` on a background window, the window reliably comes to the foreground so my subsequent click/type operations hit the correct target.
-- **US2**: As a Claude Code user, when I call `cv_screenshot_window` on a window behind other windows, I get that window's actual content, not whatever is visually on top.
-- **US3**: As a Claude Code user, when I call `cv_find("search bar", hwnd)` on Chrome or VS Code, I get UIA matches for input fields, buttons, and links from the DOM.
-- **US4**: As a Claude Code user, when `cv_find` can't match elements, I get a screenshot so Claude can visually find what I need.
-- **US5**: As a Claude Code user, I never need to manually pass `--force-renderer-accessibility` to Chrome; the plugin activates it automatically.
+## Non-Functional Requirements
 
-## 6. Non-Functional Requirements
+### Backward Compatibility
+- All new parameters default to preserving v1.5.0 behavior
+- `hwnd=None` on keyboard tools means old behavior (no focus, no security gate)
+- `screenshot=True` by default but can be disabled
+- No breaking changes to existing tool signatures
 
-- **No new dependencies**: All fixes use existing pywin32, ctypes, comtypes, mss, Pillow
-- **Backward compatibility**: All tool signatures unchanged; new fields (like `image_path` in cv_find error) are additive
-- **Security gates preserved**: All existing checks remain intact. Chrome accessibility activation is read-only (no rate limit or dry-run needed)
-- **Screen-absolute physical pixel coordinates**: No coordinate system changes
-- **Performance**: PrintWindow adds ~20-50ms per capture vs MSS; acceptable tradeoff for correctness. Chrome accessibility activation is one-time ~200ms per window.
-- **GDI resource safety**: All DC/bitmap handles cleaned up in finally blocks. Zero handle leaks.
-- **Existing test suite**: All 218 unit tests must pass. New tests added for focus retries, PrintWindow capture, Chrome activation, and vision fallback.
-- **Thread safety**: Chrome activation cache is a module-level set; safe since MCP tools run sequentially.
+### Performance
+- Post-action screenshots add ~100-200ms per action (PrintWindow + PNG save + settle delay)
+- Window state metadata adds <5ms (Win32 API calls)
+- Acceptable for interactive automation where reliability > speed
 
-## 7. Assumptions & Constraints
+### Security
+- cv_scroll: Full mutating-tool security gate (F5-F9 pattern from CLAUDE.md)
+- cv_type_text/cv_send_keys with hwnd: Full security gate when hwnd provided, existing minimal gate when hwnd=None
+- All tools validate hwnd before focus attempt
 
-- Windows 10 21H2+ or Windows 11 (PW_RENDERFULLCONTENT requires Windows 8.1+)
-- Plugin runs as a background process (not foreground) — this is the primary failure mode for focus
-- Chrome/Electron apps use `Chrome_WidgetWin_1` window class and `Chrome_RenderWidgetHostHWND` renderer child
-- DPI awareness is set at process startup (already handled by `src/dpi.py`)
-- No new dependencies allowed — all via existing pywin32, ctypes, comtypes
-- Token cost is NOT a concern — speed and accuracy are the priorities
+### Testing
+- Every new tool and every modified tool gets unit tests with mocked Win32 APIs
+- Test focus-before-type, screenshot-in-response, scroll directions, backward compatibility (hwnd=None)
+- Target: 100% coverage on new code, zero regressions on 272 existing tests
+
+### Resource Management
+- Screenshots go to existing temp dir with 5-minute auto-cleanup
+- No new dependencies
+- No new temp dirs or persistent state
+
+## Assumptions & Constraints
+
+- MCP server runs as stdio transport (never HTTP/SSE)
+- The terminal process reclaims focus between tool calls (fundamental constraint)
+- UAC dialogs on the secure desktop are unreachable by SendInput (explicit limitation)
+- Chrome/Electron UIA trees remain sparse for web content (design for this)
+- OCR en-US language pack may not be installed (don't depend on it)
+- Modal child dialogs may have different HWNDs from parent (cv_list_windows with include_children=True already handles this)
+- File dialogs use Win32 controls (standard UIA should work)
+
+## Edge Cases
+
+- **Modal dialogs**: cv_list_windows returns child windows. cv_find walks the modal's UIA tree. Document that modal dialogs block parent window input.
+- **Minimized windows**: Existing PrintWindow capture + SW_SHOWNOACTIVATE handles this.
+- **Multi-monitor**: Existing coordinate system is screen-absolute physical pixels across all monitors.
+- **DPI scaling**: Existing DPI awareness set at startup. Coordinates are physical pixels.
