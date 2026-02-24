@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import threading
+import time
 from typing import Any
 
 import comtypes
 import comtypes.client
+import win32gui
+import win32process
 
 from src import config
 from src.models import Rect, UiaElement
@@ -17,6 +21,16 @@ logger = logging.getLogger(__name__)
 # COM CLSIDs and IIDs for UI Automation
 CLSID_CUIAutomation = comtypes.GUID("{FF48DBA4-60EF-4201-AA87-54103EEF594E}")
 IID_IUIAutomation = comtypes.GUID("{30CBE57D-D9D0-452A-AB13-7AC5AC4825EE}")
+
+# Chromium/Electron accessibility activation constants
+_CHROMIUM_PROCESSES = frozenset({
+    'chrome', 'msedge', 'electron', 'code', 'slack', 'discord',
+    'teams', 'spotify', 'notion', 'figma', 'postman', 'brave', 'vivaldi', 'opera'
+})
+WM_GETOBJECT = 0x003D
+OBJID_CLIENT = 0xFFFFFFFC  # -4 as unsigned 32-bit
+SMTO_ABORTIFHUNG = 0x0002
+_activated_hwnds: set[int] = set()
 
 # Control type IDs for interactive elements
 INTERACTIVE_CONTROL_TYPES: set[int] = {
@@ -143,6 +157,71 @@ def _safe_init_uia() -> Any:
         return _init_uia_raw()
 
 
+def _ensure_chromium_accessibility(hwnd: int) -> None:
+    """Send WM_GETOBJECT to Chrome/Electron renderer widgets to activate their UIA tree.
+
+    Chromium-based apps (Chrome, Edge, VS Code, Slack, Discord, etc.) do not expose
+    their accessibility tree by default. Sending WM_GETOBJECT with OBJID_CLIENT to
+    their Chrome_RenderWidgetHostHWND children forces the accessibility tree to populate.
+
+    This is a no-op for non-Chromium windows. Activation failures are silently caught
+    so they never break the existing UIA tree walk.
+    """
+    try:
+        # Check cache -- skip if already activated
+        if hwnd in _activated_hwnds:
+            return
+
+        # Get process name from hwnd
+        from src.utils.win32_window import _get_process_name
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        process_name = _get_process_name(pid)
+
+        # Get window class
+        class_name = win32gui.GetClassName(hwnd)
+
+        # Check if this is a Chromium-based window
+        if process_name.lower() not in _CHROMIUM_PROCESSES and class_name != "Chrome_WidgetWin_1":
+            return
+
+        # Find Chrome_RenderWidgetHostHWND children
+        renderer_children: list[int] = []
+
+        def _enum_callback(child_hwnd: int, results: list[int]) -> bool:
+            try:
+                child_class = win32gui.GetClassName(child_hwnd)
+                if child_class == "Chrome_RenderWidgetHostHWND":
+                    results.append(child_hwnd)
+            except Exception:
+                pass
+            return True
+
+        win32gui.EnumChildWindows(hwnd, _enum_callback, renderer_children)
+
+        # Send WM_GETOBJECT to each renderer child
+        for child_hwnd in renderer_children:
+            result = ctypes.c_long(0)
+            ctypes.windll.user32.SendMessageTimeoutW(
+                child_hwnd,
+                WM_GETOBJECT,
+                0,
+                OBJID_CLIENT,
+                SMTO_ABORTIFHUNG,
+                2000,
+                ctypes.byref(result),
+            )
+
+        # Wait for Chrome to populate the accessibility tree
+        if renderer_children:
+            time.sleep(0.2)
+
+        # Cache this hwnd so we don't re-activate
+        _activated_hwnds.add(hwnd)
+
+    except Exception:
+        logger.debug("Chromium accessibility activation failed for HWND %d", hwnd, exc_info=True)
+
+
 def get_ui_tree(
     hwnd: int,
     depth: int = 5,
@@ -160,6 +239,8 @@ def get_ui_tree(
         List of UiaElement trees.
     """
     uia = _safe_init_uia()
+
+    _ensure_chromium_accessibility(hwnd)
 
     # Counter for generating ref_ids (mutable container for closure)
     counter = [0]

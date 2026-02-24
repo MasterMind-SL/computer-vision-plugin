@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import time as _time
 from difflib import SequenceMatcher
 
 import win32gui
@@ -27,6 +28,19 @@ from src.utils.security import (
 from src.utils.uia import get_ui_tree
 
 logger = logging.getLogger(__name__)
+
+# Per-HWND screenshot cooldown to avoid spamming captures on repeated no-match calls
+_screenshot_cooldowns: dict[int, float] = {}
+_SCREENSHOT_COOLDOWN = 5.0  # seconds between screenshots for same HWND
+
+
+def _can_screenshot(hwnd: int) -> bool:
+    """Check if enough time has elapsed since last screenshot for this HWND."""
+    last = _screenshot_cooldowns.get(hwnd)
+    if last is None:
+        return True
+    return _time.monotonic() - last >= _SCREENSHOT_COOLDOWN
+
 
 # Fuzzy match threshold -- minimum SequenceMatcher ratio to consider a match
 _MATCH_THRESHOLD = 0.5
@@ -316,10 +330,25 @@ def cv_find(
     )
 
     if not matches:
-        return make_error(
+        error = make_error(
             FIND_NO_MATCH,
             f"No elements matching '{query}' found in window {hwnd} using {method_used}.",
         )
+        # Vision fallback: attach a screenshot so Claude can visually inspect the window
+        if _can_screenshot(hwnd):
+            try:
+                from src.utils.screenshot import capture_window
+
+                capture_result = capture_window(hwnd, max_width=1280)
+                _screenshot_cooldowns[hwnd] = _time.monotonic()
+                error["error"]["image_path"] = capture_result.image_path
+                error["error"]["message"] = (
+                    f"No elements matching '{query}' found. "
+                    "Use Read tool on image_path to visually inspect the window."
+                )
+            except Exception:
+                pass  # Capture failure: return normal error without image_path
+        return error
 
     return make_success(
         matches=[m.model_dump() for m in matches[:max_results]],

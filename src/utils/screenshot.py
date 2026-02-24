@@ -30,11 +30,82 @@ _MAX_AGE_SECONDS = 300
 logger = logging.getLogger(__name__)
 
 
+def _is_all_black(img: Image.Image) -> bool:
+    """Check if an image is entirely black (all channels min==max==0)."""
+    try:
+        extrema = img.getextrema()
+        # For RGB images, extrema is ((min_r, max_r), (min_g, max_g), (min_b, max_b))
+        if isinstance(extrema[0], tuple):
+            return all(mn == 0 and mx == 0 for mn, mx in extrema)
+        # For single-channel images
+        return extrema[0] == 0 and extrema[1] == 0
+    except Exception:
+        return False
+
+
+def _capture_window_impl(hwnd: int) -> Image.Image:
+    """Shared capture logic for window capture with PrintWindow-first 3-tier fallback.
+
+    Handles minimized windows by temporarily showing them without activation.
+
+    Tier 1: PrintWindow with PW_RENDERFULLCONTENT (flag=2) - validate not all-black
+    Tier 2: PrintWindow with flag=0 - validate not all-black
+    Tier 3: mss region capture as last resort
+
+    Args:
+        hwnd: Window handle to capture.
+
+    Returns:
+        PIL Image of the captured window.
+
+    Raises:
+        CVPluginError: If all capture methods fail.
+    """
+    # Handle minimized windows
+    was_minimized = bool(ctypes.windll.user32.IsIconic(hwnd))
+    if was_minimized:
+        SW_SHOWNOACTIVATE = 4
+        win32gui.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
+
+    try:
+        rect_tuple = win32gui.GetWindowRect(hwnd)
+        left, top, right, bottom = rect_tuple
+        width = right - left
+        height = bottom - top
+
+        if width <= 0 or height <= 0:
+            raise CVPluginError(CAPTURE_FAILED, f"Window HWND {hwnd} has zero size")
+
+        # Tier 1: PrintWindow with PW_RENDERFULLCONTENT
+        img = _capture_with_printwindow(hwnd, width, height, flag=2)
+        if img is not None and not _is_all_black(img):
+            return img
+
+        # Tier 2: PrintWindow with flag=0
+        img = _capture_with_printwindow(hwnd, width, height, flag=0)
+        if img is not None and not _is_all_black(img):
+            return img
+
+        # Tier 3: mss region capture (last resort)
+        img = _capture_region_mss(left, top, width, height)
+        if img is not None:
+            return img
+
+        raise CVPluginError(CAPTURE_FAILED, f"Failed to capture window HWND {hwnd}")
+    finally:
+        if was_minimized:
+            try:
+                SW_MINIMIZE = 6
+                win32gui.ShowWindow(hwnd, SW_MINIMIZE)
+            except Exception:
+                pass
+
+
 def capture_window(hwnd: int, max_width: int = 1280) -> ScreenshotResult:
     """Capture a specific window by HWND.
 
-    Uses mss to capture the window's screen region. Falls back to PrintWindow
-    for occluded or off-screen windows.
+    Uses PrintWindow-first 3-tier fallback for reliable capture of
+    occluded or off-screen windows.
 
     Args:
         hwnd: Window handle to capture.
@@ -46,23 +117,12 @@ def capture_window(hwnd: int, max_width: int = 1280) -> ScreenshotResult:
     if not is_window_valid(hwnd):
         raise WindowNotFoundError(hwnd)
 
+    img = _capture_window_impl(hwnd)
+
     rect_tuple = win32gui.GetWindowRect(hwnd)
     left, top, right, bottom = rect_tuple
     width = right - left
     height = bottom - top
-
-    if width <= 0 or height <= 0:
-        raise CVPluginError(CAPTURE_FAILED, f"Window HWND {hwnd} has zero size")
-
-    # Try mss first (fast, but only works for visible screen regions)
-    img = _capture_region_mss(left, top, width, height)
-
-    if img is None:
-        # Fallback to PrintWindow for occluded/off-screen windows
-        img = _capture_with_printwindow(hwnd, width, height)
-
-    if img is None:
-        raise CVPluginError(CAPTURE_FAILED, f"Failed to capture window HWND {hwnd}")
 
     dpi = get_window_dpi(hwnd)
     scale = get_scale_factor(dpi)
@@ -164,19 +224,7 @@ def capture_window_raw(hwnd: int) -> Image.Image | None:
         return None
 
     try:
-        rect_tuple = win32gui.GetWindowRect(hwnd)
-        left, top, right, bottom = rect_tuple
-        width = right - left
-        height = bottom - top
-
-        if width <= 0 or height <= 0:
-            return None
-
-        img = _capture_region_mss(left, top, width, height)
-        if img is None:
-            img = _capture_with_printwindow(hwnd, width, height)
-
-        return img
+        return _capture_window_impl(hwnd)
     except Exception as exc:
         logger.debug("capture_window_raw failed for HWND %s: %s", hwnd, exc)
         return None
@@ -211,13 +259,20 @@ def _capture_region_mss(left: int, top: int, width: int, height: int) -> Image.I
         return None
 
 
-def _capture_with_printwindow(hwnd: int, width: int, height: int) -> Image.Image | None:
+def _capture_with_printwindow(hwnd: int, width: int, height: int, flag: int = 2) -> Image.Image | None:
     """Capture a window using PrintWindow (works for occluded windows).
+
+    Args:
+        hwnd: Window handle.
+        width: Capture width in pixels.
+        height: Capture height in pixels.
+        flag: PrintWindow flag. 2 = PW_RENDERFULLCONTENT, 0 = default.
 
     Returns PIL Image or None on failure.
     """
     hdc_window = None
     hdc_mem = None
+    hdc_compat = None
     bitmap = None
     try:
         hdc_window = win32gui.GetWindowDC(hwnd)
@@ -228,13 +283,7 @@ def _capture_with_printwindow(hwnd: int, width: int, height: int) -> Image.Image
         bitmap.CreateCompatibleBitmap(hdc_mem, width, height)
         hdc_compat.SelectObject(bitmap)
 
-        # PW_RENDERFULLCONTENT = 0x00000002 (captures DWM-composed content)
-        PW_RENDERFULLCONTENT = 2
-        result = ctypes.windll.user32.PrintWindow(hwnd, hdc_compat.GetSafeHdc(), PW_RENDERFULLCONTENT)
-
-        if not result:
-            # Fallback without PW_RENDERFULLCONTENT
-            result = ctypes.windll.user32.PrintWindow(hwnd, hdc_compat.GetSafeHdc(), 0)
+        result = ctypes.windll.user32.PrintWindow(hwnd, hdc_compat.GetSafeHdc(), flag)
 
         if not result:
             return None
@@ -253,12 +302,17 @@ def _capture_with_printwindow(hwnd: int, width: int, height: int) -> Image.Image
         )
         return img
     except Exception as exc:
-        logger.debug("PrintWindow failed for HWND %s: %s", hwnd, exc)
+        logger.debug("PrintWindow(flag=%d) failed for HWND %s: %s", flag, hwnd, exc)
         return None
     finally:
         if bitmap is not None:
             try:
                 win32gui.DeleteObject(bitmap.GetHandle())
+            except Exception:
+                pass
+        if hdc_compat is not None:
+            try:
+                hdc_compat.DeleteDC()
             except Exception:
                 pass
         if hdc_mem is not None:

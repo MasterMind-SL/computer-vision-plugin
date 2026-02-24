@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import ctypes
+import ctypes.wintypes
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -158,11 +160,149 @@ def get_window_info(hwnd: int) -> WindowInfo:
     return info
 
 
-def focus_window(hwnd: int) -> bool:
-    """Bring a window to the foreground.
+def _is_focused(hwnd: int) -> bool:
+    """Check if the given window is currently the foreground window."""
+    return ctypes.windll.user32.GetForegroundWindow() == hwnd
 
-    Restores minimized windows before focusing. Uses AttachThreadInput
-    workaround for cross-process activation.
+
+def _strategy_direct(hwnd: int) -> bool:
+    """Strategy 1: Direct SetForegroundWindow call."""
+    try:
+        win32gui.SetForegroundWindow(hwnd)
+        return _is_focused(hwnd)
+    except Exception as exc:
+        logger.debug("Direct focus failed for HWND %s: %s", hwnd, exc)
+        return False
+
+
+def _strategy_alt_trick(hwnd: int) -> bool:
+    """Strategy 2: Inject ALT key via SendInput to unlock foreground, then SetForegroundWindow.
+
+    Uses paired keydown+keyup in a single SendInput call to prevent stuck keys.
+    """
+    try:
+        # Define INPUT structures for SendInput
+        INPUT_KEYBOARD = 1
+        KEYEVENTF_KEYUP = 0x0002
+        VK_MENU = 0x12
+
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = [
+                ("wVk", ctypes.wintypes.WORD),
+                ("wScan", ctypes.wintypes.WORD),
+                ("dwFlags", ctypes.wintypes.DWORD),
+                ("time", ctypes.wintypes.DWORD),
+                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+            ]
+
+        class INPUT(ctypes.Structure):
+            class _INPUT_UNION(ctypes.Union):
+                _fields_ = [("ki", KEYBDINPUT)]
+            _fields_ = [
+                ("type", ctypes.wintypes.DWORD),
+                ("union", _INPUT_UNION),
+            ]
+
+        # Build paired keydown + keyup inputs
+        inputs = (INPUT * 2)()
+
+        # ALT keydown
+        inputs[0].type = INPUT_KEYBOARD
+        inputs[0].union.ki.wVk = VK_MENU
+        inputs[0].union.ki.dwFlags = 0
+
+        # ALT keyup
+        inputs[1].type = INPUT_KEYBOARD
+        inputs[1].union.ki.wVk = VK_MENU
+        inputs[1].union.ki.dwFlags = KEYEVENTF_KEYUP
+
+        ctypes.windll.user32.SendInput(2, ctypes.pointer(inputs[0]), ctypes.sizeof(INPUT))
+
+        win32gui.SetForegroundWindow(hwnd)
+        return _is_focused(hwnd)
+    except Exception as exc:
+        logger.debug("ALT trick focus failed for HWND %s: %s", hwnd, exc)
+        return False
+
+
+def _strategy_attach_thread(hwnd: int) -> bool:
+    """Strategy 3: AttachThreadInput + BringWindowToTop + SetForegroundWindow."""
+    fg_hwnd = ctypes.windll.user32.GetForegroundWindow()
+    if fg_hwnd == 0:
+        fg_hwnd = hwnd
+    fg_thread, _ = win32process.GetWindowThreadProcessId(fg_hwnd)
+    target_thread, _ = win32process.GetWindowThreadProcessId(hwnd)
+    attached = False
+    try:
+        if fg_thread != target_thread:
+            ctypes.windll.user32.AttachThreadInput(target_thread, fg_thread, True)
+            attached = True
+        win32gui.BringWindowToTop(hwnd)
+        win32gui.SetForegroundWindow(hwnd)
+        return _is_focused(hwnd)
+    except Exception as exc:
+        logger.debug("AttachThreadInput focus failed for HWND %s: %s", hwnd, exc)
+        return False
+    finally:
+        if attached:
+            try:
+                ctypes.windll.user32.AttachThreadInput(target_thread, fg_thread, False)
+            except Exception:
+                pass
+
+
+def _strategy_spi_bypass(hwnd: int) -> bool:
+    """Strategy 4: Temporarily zero the foreground lock timeout via SystemParametersInfoW."""
+    SPI_GETFOREGROUNDLOCKTIMEOUT = 0x2000
+    SPI_SETFOREGROUNDLOCKTIMEOUT = 0x2001
+    SPIF_SENDCHANGE = 0x0002
+
+    old_timeout = ctypes.wintypes.DWORD(0)
+    restored = False
+    try:
+        ctypes.windll.user32.SystemParametersInfoW(
+            SPI_GETFOREGROUNDLOCKTIMEOUT, 0, ctypes.byref(old_timeout), 0
+        )
+        ctypes.windll.user32.SystemParametersInfoW(
+            SPI_SETFOREGROUNDLOCKTIMEOUT, 0, None, SPIF_SENDCHANGE
+        )
+        win32gui.SetForegroundWindow(hwnd)
+        result = _is_focused(hwnd)
+        return result
+    except Exception as exc:
+        logger.debug("SPI bypass focus failed for HWND %s: %s", hwnd, exc)
+        return False
+    finally:
+        try:
+            ctypes.windll.user32.SystemParametersInfoW(
+                SPI_SETFOREGROUNDLOCKTIMEOUT, 0,
+                ctypes.cast(ctypes.c_void_p(old_timeout.value), ctypes.c_void_p),
+                SPIF_SENDCHANGE,
+            )
+            restored = True
+        except Exception:
+            pass
+        if not restored:
+            logger.debug("Failed to restore SPI foreground lock timeout")
+
+
+# Ordered list of focus strategies
+_FOCUS_STRATEGIES = [
+    _strategy_direct,
+    _strategy_alt_trick,
+    _strategy_attach_thread,
+    _strategy_spi_bypass,
+]
+
+_FOCUS_MAX_ATTEMPTS = 6
+_FOCUS_RETRY_DELAY = 0.05  # 50ms
+
+
+def focus_window(hwnd: int) -> bool:
+    """Bring a window to the foreground using a 4-strategy escalation.
+
+    Restores minimized windows before focusing. Tries up to 6 attempts
+    cycling through strategies: direct, ALT trick, AttachThreadInput, SPI bypass.
 
     Args:
         hwnd: Window handle to focus.
@@ -175,31 +315,29 @@ def focus_window(hwnd: int) -> bool:
 
     try:
         # Restore if minimized
-        placement = win32gui.GetWindowPlacement(hwnd)
-        if placement[1] == win32con.SW_SHOWMINIMIZED:
+        if ctypes.windll.user32.IsIconic(hwnd):
             win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-
-        # Use AttachThreadInput trick for cross-process focus
-        foreground_hwnd = win32gui.GetForegroundWindow()
-        if foreground_hwnd != hwnd:
-            fg_thread, _ = win32process.GetWindowThreadProcessId(foreground_hwnd)
-            target_thread, _ = win32process.GetWindowThreadProcessId(hwnd)
-
-            if fg_thread != target_thread:
-                ctypes.windll.user32.AttachThreadInput(fg_thread, target_thread, True)
-                try:
-                    win32gui.SetForegroundWindow(hwnd)
-                finally:
-                    ctypes.windll.user32.AttachThreadInput(fg_thread, target_thread, False)
-            else:
-                win32gui.SetForegroundWindow(hwnd)
-        else:
-            win32gui.SetForegroundWindow(hwnd)
-
-        return True
     except Exception as exc:
-        logger.warning("Failed to focus window HWND %s: %s", hwnd, exc)
-        return False
+        logger.debug("Failed to restore minimized window HWND %s: %s", hwnd, exc)
+
+    for attempt in range(_FOCUS_MAX_ATTEMPTS):
+        strategy_index = attempt % len(_FOCUS_STRATEGIES)
+        strategy = _FOCUS_STRATEGIES[strategy_index]
+
+        try:
+            if strategy(hwnd):
+                return True
+        except Exception as exc:
+            logger.debug(
+                "Focus strategy %s attempt %d failed for HWND %s: %s",
+                strategy.__name__, attempt, hwnd, exc,
+            )
+
+        if attempt < _FOCUS_MAX_ATTEMPTS - 1:
+            time.sleep(_FOCUS_RETRY_DELAY)
+
+    logger.warning("All focus strategies exhausted for HWND %s after %d attempts", hwnd, _FOCUS_MAX_ATTEMPTS)
+    return False
 
 
 def move_window(hwnd: int, x: int, y: int, width: int, height: int) -> Rect:
