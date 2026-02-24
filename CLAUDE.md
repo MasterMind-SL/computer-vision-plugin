@@ -19,7 +19,7 @@ This is an MCP plugin that gives Claude Code full computer vision and input cont
   4. `guard_dry_run(tool, params)` — return early if dry-run
   5. `log_action(tool, params, status)` — audit log
 - **Coordinates**: Screen-absolute physical pixels by default. DPI awareness set at startup.
-- **Screenshots**: Return native MCP `[ImageContent, TextContent]` content blocks via `_make_image_response()` in `capture.py`. Use `ImageContent` from `mcp.types` directly — do NOT use FastMCP's `Image` wrapper (double-encoding risk). Use `capture_window_raw()` / `capture_region_raw()` internally for OCR to avoid encode-decode round-trips.
+- **Screenshots**: Save images to temp files (`%TEMP%/cv_plugin_screenshots/`) and return `image_path` in the JSON response. Claude uses the `Read` tool on `image_path` to view images natively as a multimodal LLM. Files auto-clean after 5 minutes. Use `capture_window_raw()` / `capture_region_raw()` internally for OCR to avoid file round-trips.
 - **Imports**: Tool files import `mcp` from `src.server`, NOT create their own FastMCP instance.
 
 ## Testing

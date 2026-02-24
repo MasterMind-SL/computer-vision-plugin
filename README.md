@@ -6,7 +6,7 @@ Desktop computer vision and input control for Claude Code on Windows. Like Claud
 
 This MCP plugin gives Claude Code the ability to see and interact with any window on your Windows desktop:
 
-- **Screenshot** any window, the full desktop, or a specific screen region — returned as **native images** Claude can see directly
+- **Screenshot** any window, the full desktop, or a specific screen region — saved to temp files, viewable natively via Read tool
 - **List windows** with title, process, position, and monitor info
 - **Click** anywhere on screen (left/right/double/middle/drag)
 - **Type text** and **send keyboard shortcuts** to any application
@@ -47,9 +47,9 @@ claude --plugin-dir .
 | Tool | Description |
 |------|-------------|
 | `cv_list_windows` | List all visible windows with HWND, title, process, rect |
-| `cv_screenshot_window` | Capture a specific window by HWND (native image + metadata) |
-| `cv_screenshot_desktop` | Capture the entire desktop (native image + metadata) |
-| `cv_screenshot_region` | Capture a rectangular region (native image + metadata) |
+| `cv_screenshot_window` | Capture a window — returns `image_path` for native viewing |
+| `cv_screenshot_desktop` | Capture the desktop — returns `image_path` for native viewing |
+| `cv_screenshot_region` | Capture a region — returns `image_path` for native viewing |
 | `cv_focus_window` | Bring a window to the foreground |
 | `cv_mouse_click` | Click at screen coordinates (left/right/double/middle/drag) |
 | `cv_type_text` | Type text into the foreground window (Unicode) |
@@ -66,10 +66,11 @@ claude --plugin-dir .
 **List windows and take a screenshot:**
 1. `cv_list_windows` — see all open windows
 2. Find the HWND of your target window
-3. `cv_screenshot_window(hwnd=<HWND>)` — Claude **sees** the window as a native image
+3. `cv_screenshot_window(hwnd=<HWND>)` — get `image_path`
+4. Use Read tool on `image_path` — Claude **sees** the window natively
 
 **Click a button in an app:**
-1. `cv_screenshot_window` — Claude sees the current state visually
+1. `cv_screenshot_window` + Read `image_path` — Claude sees the current state
 2. Identify button coordinates from what Claude sees
 3. `cv_mouse_click(x=<X>, y=<Y>)` — click it
 4. `cv_screenshot_window` — verify the click worked
@@ -135,13 +136,15 @@ Environment variables (all optional):
 
 ## How Screenshots Work
 
-Screenshot tools return **native MCP image content blocks** (like Chrome MCP), not base64 text. This means Claude can actually **see** the captured image and reason about it visually.
+Screenshot tools **save images to temp files** and return the file path in the JSON response. Claude Code then uses the Read tool on `image_path` to view the image natively as a multimodal LLM.
 
 Each screenshot response contains:
-1. **`ImageContent`** — the PNG image, visible to Claude natively
-2. **`TextContent`** — JSON metadata (rect, DPI scale, physical/logical resolution) for coordinate math
+- **`image_path`** — absolute path to the saved PNG file (auto-cleaned after 5 min)
+- **`rect`** — window/region position and size in screen pixels
+- **`physical_resolution`** / **`logical_resolution`** — for DPI-aware coordinate math
+- **`dpi_scale`** — scale factor for the captured window/region
 
-This follows the same pattern as Chrome DevTools MCP and other visual MCP servers.
+This approach avoids base64 overhead and context window limits, and leverages Claude's native image understanding via the Read tool.
 
 ## Architecture
 
@@ -156,7 +159,7 @@ src/
 ├── coordinates.py       # Coordinate transforms
 ├── tools/               # MCP tool definitions (14 tools)
 │   ├── windows.py       # F1, F5, F9
-│   ├── capture.py       # F2, F3, F4 (returns native ImageContent)
+│   ├── capture.py       # F2, F3, F4 (saves to temp file, returns path)
 │   ├── input_mouse.py   # F6
 │   ├── input_keyboard.py # F7, F8
 │   ├── ocr.py           # F10

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import base64
 import ctypes
-import io
 import logging
+import os
+import tempfile
+import time
 from typing import Any
 
 import mss
@@ -18,6 +19,13 @@ from src.dpi import get_window_dpi, get_scale_factor
 from src.errors import WindowNotFoundError, CVPluginError, CAPTURE_FAILED
 from src.models import Rect, ScreenshotResult
 from src.utils.win32_window import is_window_valid
+
+# Temp directory for saved screenshots — cleaned up automatically
+_SCREENSHOT_DIR = os.path.join(tempfile.gettempdir(), "cv_plugin_screenshots")
+os.makedirs(_SCREENSHOT_DIR, exist_ok=True)
+
+# Max age for screenshot files (seconds) before auto-cleanup
+_MAX_AGE_SECONDS = 300
 
 logger = logging.getLogger(__name__)
 
@@ -59,10 +67,10 @@ def capture_window(hwnd: int, max_width: int = 1280) -> ScreenshotResult:
     dpi = get_window_dpi(hwnd)
     scale = get_scale_factor(dpi)
 
-    b64 = encode_image(img, max_width=max_width)
+    filepath = save_image(img, max_width=max_width)
 
     return ScreenshotResult(
-        image_base64=b64,
+        image_path=filepath,
         rect=Rect(x=left, y=top, width=width, height=height),
         physical_resolution={"width": img.width, "height": img.height},
         logical_resolution={
@@ -89,10 +97,10 @@ def capture_desktop(max_width: int = 1920) -> ScreenshotResult:
         screenshot = sct.grab(monitor)
         img = Image.frombytes("RGB", screenshot.size, screenshot.rgb)
 
-    b64 = encode_image(img, max_width=max_width)
+    filepath = save_image(img, max_width=max_width)
 
     return ScreenshotResult(
-        image_base64=b64,
+        image_path=filepath,
         rect=Rect(
             x=monitor["left"],
             y=monitor["top"],
@@ -134,10 +142,10 @@ def capture_region(x0: int, y0: int, x1: int, y1: int, max_width: int = 1280) ->
         screenshot = sct.grab(region)
         img = Image.frombytes("RGB", screenshot.size, screenshot.rgb)
 
-    b64 = encode_image(img, max_width=max_width)
+    filepath = save_image(img, max_width=max_width)
 
     return ScreenshotResult(
-        image_base64=b64,
+        image_path=filepath,
         rect=Rect(x=x0, y=y0, width=width, height=height),
         physical_resolution={"width": img.width, "height": img.height},
         logical_resolution={"width": img.width, "height": img.height},
@@ -265,28 +273,44 @@ def _capture_with_printwindow(hwnd: int, width: int, height: int) -> Image.Image
                 pass
 
 
-def encode_image(img: Image.Image, max_width: int = 1280, fmt: str = "png", quality: int = 95) -> str:
-    """Downscale and encode a PIL Image to base64 string.
+def _cleanup_old_screenshots() -> None:
+    """Remove screenshot files older than _MAX_AGE_SECONDS."""
+    try:
+        now = time.time()
+        for fname in os.listdir(_SCREENSHOT_DIR):
+            fpath = os.path.join(_SCREENSHOT_DIR, fname)
+            if os.path.isfile(fpath) and (now - os.path.getmtime(fpath)) > _MAX_AGE_SECONDS:
+                os.remove(fpath)
+    except Exception:
+        pass  # best-effort cleanup
+
+
+def save_image(img: Image.Image, max_width: int = 1280, fmt: str = "png") -> str:
+    """Downscale and save a PIL Image to a temp file.
 
     Args:
-        img: PIL Image to encode.
+        img: PIL Image to save.
         max_width: Maximum width for downscaling.
         fmt: Image format ("png" or "jpeg").
-        quality: JPEG quality (1-100). Ignored for PNG.
 
     Returns:
-        Base64-encoded image string.
+        Absolute file path to the saved image.
     """
+    _cleanup_old_screenshots()
+
     if img.width > max_width:
         ratio = max_width / img.width
         new_height = int(img.height * ratio)
         img = img.resize((max_width, new_height), Image.Resampling.LANCZOS)
 
-    buffer = io.BytesIO()
+    timestamp = int(time.time() * 1000)
+    filename = f"cv_{timestamp}.{fmt}"
+    filepath = os.path.join(_SCREENSHOT_DIR, filename)
+
     if fmt.lower() == "jpeg":
         img = img.convert("RGB")
-        img.save(buffer, format="JPEG", quality=quality)
+        img.save(filepath, format="JPEG", quality=95)
     else:
-        img.save(buffer, format="PNG")
+        img.save(filepath, format="PNG")
 
-    return base64.b64encode(buffer.getvalue()).decode("ascii")
+    return filepath

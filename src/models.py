@@ -46,7 +46,7 @@ class MonitorInfo(BaseModel):
 
 class ScreenshotResult(BaseModel):
     """Result of a screenshot capture operation."""
-    image_base64: str
+    image_path: str
     rect: Rect
     physical_resolution: dict[str, int] = Field(default_factory=dict)
     logical_resolution: dict[str, int] = Field(default_factory=dict)
